@@ -1,43 +1,82 @@
 """
-Mechanistic Milling Mechanics: Cylindrical Cutter Engaging Inconel 718 Spherical Target.
-Incorporates localized material hardness inclusions, non-ideal chip packing & clearing bursts,
-and high-frequency engagement vibration/micro-chatter.
+Mechanistic milling mechanics for a cylindrical cutter engaging a nickel-alloy spherical target.
+
+The control-oriented model deliberately keeps the geometry compact, but the disturbance
+model is stateful and physical: a deterministic spatial hardness map, chip packing/jam
+cycles, a damped structural vibration mode, and cutter dwell clearing all feed the same
+cutting-force equations. No display-only noise is injected.
 """
 
 from dataclasses import dataclass
 import math
 import random
-from typing import Tuple
+from typing import List, Tuple
 
 
 @dataclass
 class CuttingParameters:
-    """Geometrical and mechanistic cutting parameters for Inconel 718 milling."""
-    cutter_radius: float = 0.010                # Tool radius R_bit (m, 20 mm diameter)
-    flute_count: int = 4                        # Number of flutes Z
-    helix_angle_deg: float = 30.0               # Flute helix angle beta (deg)
-    target_sphere_radius: float = 0.050         # Workpiece ball radius R_sphere (m, 100 mm diameter)
-    contact_start_pos: float = 0.015            # Rod position where initial contact occurs x_0 (15 mm)
-    # Mechanistic cutting force coefficients for Inconel 718:
-    k_tc: float = 3100.0e6                      # Tangential shear coefficient K_tc (N/m^2 = Pa)
-    k_te: float = 65.0e3                        # Tangential edge coefficient K_te (N/m)
-    k_rc: float = 1350.0e6                      # Radial shear coefficient K_rc (N/m^2)
-    k_re: float = 45.0e3                        # Radial edge coefficient K_re (N/m)
-    k_ac: float = 820.0e6                       # Axial shear coefficient K_ac (N/m^2)
-    k_ae: float = 32.0e3                        # Axial edge coefficient K_ae (N/m)
-    # Level A averaged model scaling factors:
-    averaged_specific_energy: float = 3.2e9     # Specific cutting energy (J/m^3 = Pa)
-    axial_thrust_coeff: float = 1.8e7           # Axial thrust force per contact area (N/m^2)
-    rubbing_torque_coeff: float = 1200.0        # Edge rubbing torque per contact area (N*m/m^2)
-    axial_damping: float = 800.0                # Feed velocity damping (N*s/m)
-    # Level B runout eccentricity:
-    runout_amplitude: float = 1.5e-5            # 15 microns tool runout
+    """Geometrical, cutting, and disturbance parameters."""
+    cutter_radius: float = 0.010
+    flute_count: int = 4
+    helix_angle_deg: float = 30.0
+    target_sphere_radius: float = 0.050
+    contact_start_pos: float = 0.015
+
+    # Mechanistic cutting coefficients. Treat as calibration placeholders.
+    k_tc: float = 3100.0e6
+    k_te: float = 65.0e3
+    k_rc: float = 1350.0e6
+    k_re: float = 45.0e3
+    k_ac: float = 820.0e6
+    k_ae: float = 32.0e3
+
+    # Level-A control-oriented coefficients.
+    averaged_specific_energy: float = 3.2e9
+    axial_thrust_coeff: float = 1.8e7
+    rubbing_torque_coeff: float = 1200.0
+    axial_damping: float = 800.0
+
+    # Level-B runout.
+    runout_amplitude: float = 1.5e-5
+
+    # Material-removal / dwell-clearing dynamics.
+    nominal_spindle_rpm: float = 3500.0
+    clearing_time_constant: float = 0.55
+    feed_capture_ratio: float = 0.30
+    max_surface_advance_rate: float = 0.0030
+
+    # Spatial material non-uniformity.
+    material_texture_amplitude: float = 0.07
+    hard_spot_count: int = 7
+    hard_spot_depth_span: float = 0.014
+    hard_spot_width_min: float = 0.00012
+    hard_spot_width_max: float = 0.00038
+    hard_spot_gain_min: float = 0.25
+    hard_spot_gain_max: float = 0.70
+
+    # Chip transport / intermittent flute loading.
+    chip_generation_gain: float = 2.20
+    chip_evacuation_rate: float = 0.26
+    chip_jam_threshold_min: float = 0.58
+    chip_jam_threshold_max: float = 0.82
+    chip_jam_duration_min: float = 0.10
+    chip_jam_duration_max: float = 0.28
+    chip_jam_torque_gain: float = 0.95
+
+    # Structural vibration / micro-chatter mode.
+    vibration_frequency_hz: float = 58.0
+    vibration_damping_ratio: float = 0.16
+    vibration_torque_fraction: float = 0.16
+    vibration_force_fraction: float = 0.08
 
 
 class MechanisticCuttingSubsystem:
     """
-    Simulates cutting force, spindle torque, and material removal during milling.
-    Features realistic non-uniform material hardness spots, chip buildup surges, and vibration.
+    Cutting subsystem with deterministic disturbance realization.
+
+    `surface_recession_depth` is the local crater advance. The instantaneous
+    interference/engagement is the rod's geometric penetration minus that removed
+    depth. This lets load relax while the spindle keeps cutting after pump reduction.
     """
 
     def __init__(self, params: CuttingParameters = CuttingParameters(), seed: int = 42) -> None:
@@ -47,93 +86,256 @@ class MechanisticCuttingSubsystem:
 
         self.cumulative_volume_removed = 0.0
         self.penetration_depth = 0.0
+        self.surface_recession_depth = 0.0
+        self.engagement_depth = 0.0
         self.spindle_angle = 0.0
         self.sim_time = 0.0
 
-        # Physical disturbance generators:
-        self.chip_packing_level = 0.0           # Chip packing accumulation (0.0 to 1.5)
-        self.hard_spot_active = False
-        self.hard_spot_timer = 0.0
-        self.next_hard_spot_time = 1.5          # First hard inclusion occurs at ~1.5s
-        self.vibration_phase = 0.0
+        self.hardness_multiplier = 1.0
+        self.chip_packing_level = 0.0
+        self.chip_jam_active = False
+        self.chip_jam_timer = 0.0
+        self.chip_release_timer = 0.0
+        self.next_chip_jam_threshold = 0.70
+
+        self.vibration_state = 0.0
+        self.vibration_velocity = 0.0
+        self.vibration_torque = 0.0
+        self.vibration_force = 0.0
+        self.disturbance_event = "FREE"
+
+        self._hard_spots: List[Tuple[float, float, float]] = []
+        self._reset_disturbance_map()
+
+    def _reset_disturbance_map(self) -> None:
+        self._hard_spots = []
+        count = max(1, self.params.hard_spot_count)
+        span = max(1.0e-4, self.params.hard_spot_depth_span)
+        for i in range(count):
+            nominal = ((i + 0.65) / count) * span
+            spacing = span / count
+            center = nominal + self.rng.uniform(-0.18, 0.18) * spacing
+            width = self.rng.uniform(self.params.hard_spot_width_min, self.params.hard_spot_width_max)
+            gain = self.rng.uniform(self.params.hard_spot_gain_min, self.params.hard_spot_gain_max)
+            self._hard_spots.append((max(0.0, center), width, gain))
+        self._hard_spots.sort(key=lambda item: item[0])
+        self.next_chip_jam_threshold = self.rng.uniform(
+            self.params.chip_jam_threshold_min,
+            self.params.chip_jam_threshold_max,
+        )
 
     def reset(self) -> None:
-        """Reset cutting and workpiece crater states."""
         self.rng = random.Random(self.seed)
         self.cumulative_volume_removed = 0.0
         self.penetration_depth = 0.0
+        self.surface_recession_depth = 0.0
+        self.engagement_depth = 0.0
         self.spindle_angle = 0.0
         self.sim_time = 0.0
+        self.hardness_multiplier = 1.0
         self.chip_packing_level = 0.0
-        self.hard_spot_active = False
-        self.hard_spot_timer = 0.0
-        self.next_hard_spot_time = 1.5
-        self.vibration_phase = 0.0
+        self.chip_jam_active = False
+        self.chip_jam_timer = 0.0
+        self.chip_release_timer = 0.0
+        self.vibration_state = 0.0
+        self.vibration_velocity = 0.0
+        self.vibration_torque = 0.0
+        self.vibration_force = 0.0
+        self.disturbance_event = "FREE"
+        self._reset_disturbance_map()
 
-    def compute_engagement_geometry(self, rod_position: float) -> Tuple[float, float]:
-        """
-        Compute penetration depth d and projected frontal contact area A_contact
-        between cylindrical cutter and target sphere.
-        """
-        if rod_position <= self.params.contact_start_pos:
-            return 0.0, 0.0
-
-        d = rod_position - self.params.contact_start_pos
+    def _contact_area_from_depth(self, depth: float) -> float:
+        if depth <= 0.0:
+            return 0.0
         r_s = self.params.target_sphere_radius
         r_b = self.params.cutter_radius
-
-        # Projected contact area: spherical cap intersection bounded by cutter radius
+        d = min(depth, 2.0 * r_s)
         if d < r_s:
-            a_geom = math.pi * (2.0 * r_s * d - d * d)
+            a_geom = math.pi * max(0.0, 2.0 * r_s * d - d * d)
         else:
-            a_geom = math.pi * (r_s * r_s)
+            a_geom = math.pi * r_s * r_s
+        return min(a_geom, math.pi * r_b * r_b)
 
-        a_max = math.pi * (r_b * r_b)
-        a_contact = min(a_geom, a_max)
+    def compute_engagement_geometry(self, rod_position: float) -> Tuple[float, float]:
+        gross_depth = max(0.0, rod_position - self.params.contact_start_pos)
+        engagement = max(0.0, gross_depth - self.surface_recession_depth)
+        return engagement, self._contact_area_from_depth(engagement)
 
-        return d, a_contact
+    def _material_hardness(self, cut_front_depth: float) -> float:
+        depth_mm = cut_front_depth * 1000.0
+        texture = self.params.material_texture_amplitude * (
+            0.62 * math.sin(2.0 * math.pi * depth_mm / 1.55 + 0.35)
+            + 0.38 * math.sin(2.0 * math.pi * depth_mm / 0.63 + 1.2)
+        )
+        inclusions = 0.0
+        for center, width, gain in self._hard_spots:
+            z = (cut_front_depth - center) / max(width, 1.0e-6)
+            inclusions += gain * math.exp(-0.5 * z * z)
+        return max(0.82, 1.0 + texture + inclusions)
 
-    def _update_material_disturbances(self, dt: float, in_contact: bool, v_feed: float) -> Tuple[float, float]:
-        """
-        Simulate Inconel 718 hard precipitate inclusions and non-ideal chip clogging/bursts.
-        Returns: (hardness_multiplier, chip_clog_torque_surge)
-        """
-        self.sim_time += dt
+    def _update_surface_removal(
+        self,
+        dt: float,
+        gross_depth: float,
+        engagement_depth: float,
+        contact_area: float,
+        rod_velocity: float,
+        spindle_speed: float,
+        hardness: float,
+    ) -> Tuple[float, float]:
+        if engagement_depth <= 0.0 or contact_area <= 0.0 or abs(spindle_speed) < 5.0:
+            return 0.0, 0.0
+        speed_ref = self.params.nominal_spindle_rpm * math.pi / 30.0
+        speed_factor = max(0.05, min(1.35, abs(spindle_speed) / max(speed_ref, 1.0)))
+        feed_component = self.params.feed_capture_ratio * max(0.0, rod_velocity)
+        dwell_component = engagement_depth / max(0.05, self.params.clearing_time_constant)
+        chip_efficiency = 1.0 / (1.0 + 0.95 * self.chip_packing_level)
+        if self.chip_jam_active:
+            chip_efficiency *= 0.38
+        hardness_efficiency = 1.0 / max(0.85, hardness)
+        clear_rate = (feed_component + dwell_component) * speed_factor * chip_efficiency * hardness_efficiency
+        clear_rate = min(self.params.max_surface_advance_rate, max(0.0, clear_rate))
+        clearable = max(0.0, gross_depth - self.surface_recession_depth)
+        delta_clear = min(clearable, clear_rate * dt)
+        actual_rate = delta_clear / max(dt, 1.0e-9)
+        self.surface_recession_depth += delta_clear
+        mrr = contact_area * actual_rate
+        self.cumulative_volume_removed += mrr * dt
+        return mrr, actual_rate
 
+    def _update_chip_transport(
+        self,
+        dt: float,
+        mrr: float,
+        spindle_speed: float,
+        engagement_depth: float,
+        hardness: float,
+    ) -> Tuple[float, bool, bool]:
+        area_max = math.pi * self.params.cutter_radius ** 2
+        reference_mrr = max(1.0e-12, area_max * 0.001)
+        mrr_norm = min(3.0, mrr / reference_mrr)
+        speed_ref = self.params.nominal_spindle_rpm * math.pi / 30.0
+        speed_factor = min(1.5, max(0.0, abs(spindle_speed) / max(speed_ref, 1.0)))
+        engagement_ratio = min(1.0, engagement_depth / max(1.0e-6, self.params.cutter_radius))
+        generation = self.params.chip_generation_gain * mrr_norm * max(0.9, hardness)
+        evacuation = self.params.chip_evacuation_rate * speed_factor * (1.0 - 0.42 * engagement_ratio)
+        jam_started = False
+        release_started = False
+        if self.chip_release_timer > 0.0:
+            self.chip_release_timer = max(0.0, self.chip_release_timer - dt)
+        if self.chip_jam_active:
+            self.chip_jam_timer -= dt
+            self.chip_packing_level = min(
+                1.35,
+                self.chip_packing_level + dt * (0.35 * generation - 0.12 * evacuation),
+            )
+            if self.chip_jam_timer <= 0.0:
+                self.chip_jam_active = False
+                self.chip_release_timer = 0.12
+                self.chip_packing_level *= self.rng.uniform(0.16, 0.32)
+                self.next_chip_jam_threshold = self.rng.uniform(
+                    self.params.chip_jam_threshold_min,
+                    self.params.chip_jam_threshold_max,
+                )
+                release_started = True
+        else:
+            self.chip_packing_level += dt * (generation - evacuation)
+            self.chip_packing_level = min(1.25, max(0.0, self.chip_packing_level))
+            if mrr_norm > 0.12 and self.chip_packing_level >= self.next_chip_jam_threshold:
+                self.chip_jam_active = True
+                self.chip_jam_timer = self.rng.uniform(
+                    self.params.chip_jam_duration_min,
+                    self.params.chip_jam_duration_max,
+                )
+                jam_started = True
+        chip_multiplier = 1.0 + 0.42 * (self.chip_packing_level ** 1.6)
+        if self.chip_jam_active:
+            chip_multiplier += self.params.chip_jam_torque_gain * (
+                0.55 + 0.45 * min(1.0, self.chip_packing_level)
+            )
+        elif self.chip_release_timer > 0.0:
+            chip_multiplier *= 0.78
+        return max(0.65, chip_multiplier), jam_started, release_started
+
+    def _update_vibration(
+        self,
+        dt: float,
+        spindle_speed: float,
+        base_torque: float,
+        base_force: float,
+        hardness: float,
+        chip_multiplier: float,
+        jam_started: bool,
+        release_started: bool,
+    ) -> Tuple[float, float]:
+        self.spindle_angle = (self.spindle_angle + spindle_speed * dt) % (2.0 * math.pi)
+        tooth_phase = self.params.flute_count * self.spindle_angle
+        excitation = 0.70 * math.sin(tooth_phase)
+        excitation += 0.18 * self.rng.gauss(0.0, 1.0)
+        excitation += 1.2 * max(0.0, hardness - 1.0)
+        excitation += 0.85 * max(0.0, chip_multiplier - 1.0)
+        if jam_started:
+            excitation += 2.2
+        if release_started:
+            excitation -= 1.8
+        wn = 2.0 * math.pi * self.params.vibration_frequency_hz
+        zeta = self.params.vibration_damping_ratio
+        accel = (wn * wn) * (excitation - self.vibration_state) - 2.0 * zeta * wn * self.vibration_velocity
+        self.vibration_velocity += accel * dt
+        self.vibration_state += self.vibration_velocity * dt
+        self.vibration_state = max(-3.0, min(3.0, self.vibration_state))
+        self.vibration_velocity = max(-2500.0, min(2500.0, self.vibration_velocity))
+        self.vibration_torque = self.params.vibration_torque_fraction * max(0.15, base_torque) * self.vibration_state
+        self.vibration_force = self.params.vibration_force_fraction * max(20.0, base_force) * self.vibration_state
+        return self.vibration_torque, self.vibration_force
+
+    def _set_disturbance_event(self, in_contact: bool) -> None:
         if not in_contact:
-            self.chip_packing_level = 0.0
-            return 1.0, 0.0
+            self.disturbance_event = "FREE"
+        elif self.chip_jam_active:
+            self.disturbance_event = "CHIP_JAM"
+        elif self.chip_release_timer > 0.0:
+            self.disturbance_event = "CHIP_RELEASE"
+        elif self.hardness_multiplier >= 1.24:
+            self.disturbance_event = "HARD_SPOT"
+        elif abs(self.vibration_state) >= 1.05:
+            self.disturbance_event = "CHATTER"
+        else:
+            self.disturbance_event = "CUTTING"
 
-        # 1. Hard Spot (NbC/TiC Carbide Precipitate Cluster)
-        hard_mult = 1.0 + 0.08 * math.sin(19.2 * self.sim_time) + 0.05 * math.sin(7.3 * self.penetration_depth * 1000.0)
-
-        if not self.hard_spot_active and self.sim_time >= self.next_hard_spot_time:
-            self.hard_spot_active = True
-            self.hard_spot_timer = 0.0
-
-        if self.hard_spot_active:
-            self.hard_spot_timer += dt
-            # Intense localized hard spot surge (+65% hardness)
-            hard_mult += 0.65
-            if self.hard_spot_timer >= 0.20:    # Lasts 200 ms
-                self.hard_spot_active = False
-                self.hard_spot_timer = 0.0
-                # Schedule next inclusion in 1.8 to 3.2 seconds
-                self.next_hard_spot_time = self.sim_time + 1.8 + self.rng.uniform(0.0, 1.4)
-
-        # 2. Non-Ideal Chip Removal / Flute Jamming & Burst Release
-        if v_feed > 0:
-            self.chip_packing_level += 2.2 * dt * (v_feed / 0.001)
-
-        chip_clog_surge = 0.0
-        if self.chip_packing_level > 0.8:
-            # Flute gullet fills with sticky Inconel chips -> exponential torque surge
-            chip_clog_surge = 1.4 * (self.chip_packing_level - 0.8)
-            if self.chip_packing_level >= 1.5:
-                # Sudden chip evacuation / burst release!
-                self.chip_packing_level = 0.0
-
-        return hard_mult, chip_clog_surge
+    def _prepare_cut_state(
+        self,
+        dt: float,
+        rod_position: float,
+        rod_velocity: float,
+        spindle_speed: float,
+    ) -> Tuple[float, float, float, float, float, bool, bool]:
+        self.sim_time += dt
+        gross_depth = max(0.0, rod_position - self.params.contact_start_pos)
+        self.penetration_depth = gross_depth
+        engagement, area = self.compute_engagement_geometry(rod_position)
+        in_contact = engagement > 0.0 and area > 0.0 and abs(spindle_speed) > 5.0
+        if not in_contact:
+            self.chip_packing_level = max(0.0, self.chip_packing_level - 0.7 * dt)
+            self.hardness_multiplier = self._material_hardness(self.surface_recession_depth)
+            self.engagement_depth = engagement
+            self.vibration_torque = 0.0
+            self.vibration_force = 0.0
+            self._set_disturbance_event(False)
+            return engagement, area, 0.0, 0.0, 1.0, False, False
+        self.hardness_multiplier = self._material_hardness(self.surface_recession_depth)
+        mrr, _ = self._update_surface_removal(
+            dt, gross_depth, engagement, area, rod_velocity, spindle_speed, self.hardness_multiplier
+        )
+        chip_multiplier, jam_started, release_started = self._update_chip_transport(
+            dt, mrr, spindle_speed, engagement, self.hardness_multiplier
+        )
+        omega = max(1.0, abs(spindle_speed))
+        n_rev = omega / (2.0 * math.pi)
+        surface_rate = mrr / max(area, 1.0e-12)
+        h_avg = surface_rate / max(1.0e-9, self.params.flute_count * n_rev)
+        self.engagement_depth = max(0.0, gross_depth - self.surface_recession_depth)
+        return engagement, area, mrr, h_avg, chip_multiplier, jam_started, release_started
 
     def step_level_a_averaged(
         self,
@@ -142,45 +344,28 @@ class MechanisticCuttingSubsystem:
         rod_velocity: float,
         spindle_speed: float,
     ) -> Tuple[float, float, float, float]:
-        """
-        Level A (Control-Oriented): Revolution-averaged cutting forces with realistic disturbances.
-        Returns: (axial_force, cutting_torque, mrr, chip_thickness)
-        """
-        d, a_contact = self.compute_engagement_geometry(rod_position)
-        self.penetration_depth = d
-
-        in_contact = (d > 0.0 and a_contact > 0.0)
-        v_feed = max(0.0, rod_velocity)
-        omega = max(1.0, abs(spindle_speed))
-
-        hard_mult, clog_surge = self._update_material_disturbances(dt, in_contact, v_feed)
-
-        if not in_contact:
+        engagement, area, mrr, h_avg, chip_mult, jam_started, release_started = self._prepare_cut_state(
+            dt, rod_position, rod_velocity, spindle_speed
+        )
+        if engagement <= 0.0 or area <= 0.0 or abs(spindle_speed) <= 5.0:
             return 0.0, 0.0, 0.0, 0.0
-
-        # Material Removal Rate: MRR = A_contact * v_feed
-        mrr = a_contact * v_feed
-        d_vol = mrr * dt
-        self.cumulative_volume_removed += d_vol
-
-        # Average chip thickness h_avg = v_feed / (Z * n_rev)
-        n_rev = omega / (2.0 * math.pi)
-        h_avg = v_feed / (self.params.flute_count * n_rev)
-
-        # 3. Mechanical vibration & tooth-passing noise
-        self.vibration_phase = (self.vibration_phase + self.params.flute_count * omega * dt) % (2.0 * math.pi)
-        t_vib = 0.35 * math.sin(self.vibration_phase) + self.rng.gauss(0.0, 0.08)
-        f_vib = 40.0 * math.cos(self.vibration_phase) + self.rng.gauss(0.0, 15.0)
-
-        # Base cutting torque with hardness and chip clog scaling
-        base_torque = (self.params.averaged_specific_energy * hard_mult * (1.0 + clog_surge) * mrr) / omega
-        t_cutting = base_torque + self.params.rubbing_torque_coeff * a_contact * hard_mult + t_vib
-
-        # Axial Reaction Force (WOB)
-        base_axial = self.params.axial_thrust_coeff * hard_mult * (1.0 + 0.35 * clog_surge) * a_contact
-        f_axial = base_axial + self.params.axial_damping * v_feed + f_vib
-
-        return max(0.0, f_axial), max(0.0, t_cutting), mrr, h_avg
+        omega = max(1.0, abs(spindle_speed))
+        hard = self.hardness_multiplier
+        base_torque = (self.params.averaged_specific_energy * hard * chip_mult * mrr) / omega
+        rubbing = self.params.rubbing_torque_coeff * area * hard * (1.0 + 0.35 * self.chip_packing_level)
+        torque_nominal = base_torque + rubbing
+        force_nominal = (
+            self.params.axial_thrust_coeff
+            * hard
+            * (1.0 + 0.30 * max(0.0, chip_mult - 1.0))
+            * area
+            + self.params.axial_damping * max(0.0, rod_velocity)
+        )
+        t_vib, f_vib = self._update_vibration(
+            dt, spindle_speed, torque_nominal, force_nominal, hard, chip_mult, jam_started, release_started
+        )
+        self._set_disturbance_event(True)
+        return max(0.0, force_nominal + f_vib), max(0.0, torque_nominal + t_vib), mrr, h_avg
 
     def step_level_b_tooth_resolved(
         self,
@@ -189,60 +374,47 @@ class MechanisticCuttingSubsystem:
         rod_velocity: float,
         spindle_speed: float,
     ) -> Tuple[float, float, float, float]:
-        """
-        Level B (Disturbance-Rich): Tooth-resolved forces with flute passing harmonics and runout.
-        Returns: (axial_force, cutting_torque, mrr, chip_thickness)
-        """
-        d, a_contact = self.compute_engagement_geometry(rod_position)
-        self.penetration_depth = d
-
-        in_contact = (d > 0.0 and a_contact > 0.0)
-        v_feed = max(0.0, rod_velocity)
-        omega = max(1.0, abs(spindle_speed))
-
-        hard_mult, clog_surge = self._update_material_disturbances(dt, in_contact, v_feed)
-
-        if not in_contact:
+        engagement, area, mrr, h_avg, chip_mult, jam_started, release_started = self._prepare_cut_state(
+            dt, rod_position, rod_velocity, spindle_speed
+        )
+        if engagement <= 0.0 or area <= 0.0 or abs(spindle_speed) <= 5.0:
             return 0.0, 0.0, 0.0, 0.0
-
-        self.spindle_angle = (self.spindle_angle + omega * dt) % (2.0 * math.pi)
-
+        omega = max(1.0, abs(spindle_speed))
+        hard = self.hardness_multiplier
         z_flutes = self.params.flute_count
         r_b = self.params.cutter_radius
         n_rev = omega / (2.0 * math.pi)
-        feed_per_tooth = v_feed / (z_flutes * n_rev)
-
-        axial_depth = min(d, r_b)
+        surface_rate = mrr / max(area, 1.0e-12)
+        feed_per_tooth = surface_rate / max(1.0e-9, z_flutes * n_rev)
+        axial_depth = min(engagement, r_b)
         dz = max(1.0e-4, axial_depth / 5.0)
-
         total_torque = 0.0
         total_axial_force = 0.0
         max_h = 0.0
-
         for j in range(z_flutes):
             flute_angle = self.spindle_angle + j * (2.0 * math.pi / z_flutes)
             r_eff = r_b + self.params.runout_amplitude * math.cos(j * (2.0 * math.pi / z_flutes))
-
             for z_idx in range(5):
                 z_curr = (z_idx + 0.5) * dz
                 helix_lag = (z_curr * math.tan(math.radians(self.params.helix_angle_deg))) / r_b
                 phi = (flute_angle - helix_lag) % (2.0 * math.pi)
-
                 if 0.0 < phi < math.pi:
-                    h_inst = feed_per_tooth * math.sin(phi)
-                    if h_inst > max_h:
-                        max_h = h_inst
-
-                    df_t = (self.params.k_tc * hard_mult * (1.0 + clog_surge) * h_inst + self.params.k_te) * dz
-                    df_a = (self.params.k_ac * hard_mult * h_inst + self.params.k_ae) * dz
-
+                    h_inst = max(0.0, feed_per_tooth * math.sin(phi))
+                    max_h = max(max_h, h_inst)
+                    df_t = (self.params.k_tc * hard * chip_mult * h_inst + self.params.k_te * hard) * dz
+                    df_a = (self.params.k_ac * hard * h_inst + self.params.k_ae) * dz
                     total_torque += df_t * r_eff
                     total_axial_force += df_a
-
-        mrr = a_contact * v_feed
-        self.cumulative_volume_removed += mrr * dt
-
-        total_axial_force += self.params.axial_thrust_coeff * hard_mult * a_contact * 0.4
-        total_torque += self.params.rubbing_torque_coeff * a_contact * 0.4
-
-        return max(0.0, total_axial_force), max(0.0, total_torque), mrr, max_h
+        total_axial_force += self.params.axial_thrust_coeff * hard * area * 0.35
+        total_torque += self.params.rubbing_torque_coeff * area * 0.35
+        t_vib, f_vib = self._update_vibration(
+            dt, spindle_speed, max(0.15, total_torque), max(20.0, total_axial_force),
+            hard, chip_mult, jam_started, release_started
+        )
+        self._set_disturbance_event(True)
+        return (
+            max(0.0, total_axial_force + f_vib),
+            max(0.0, total_torque + t_vib),
+            mrr,
+            max(max_h, h_avg),
+        )
