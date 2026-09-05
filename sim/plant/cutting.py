@@ -1,10 +1,12 @@
 """
 Mechanistic Milling Mechanics: Cylindrical Cutter Engaging Inconel 718 Spherical Target.
-Provides Level A (revolution-averaged) and Level B (tooth-resolved) fidelity models.
+Incorporates localized material hardness inclusions, non-ideal chip packing & clearing bursts,
+and high-frequency engagement vibration/micro-chatter.
 """
 
 from dataclasses import dataclass
 import math
+import random
 from typing import Tuple
 
 
@@ -15,8 +17,8 @@ class CuttingParameters:
     flute_count: int = 4                        # Number of flutes Z
     helix_angle_deg: float = 30.0               # Flute helix angle beta (deg)
     target_sphere_radius: float = 0.050         # Workpiece ball radius R_sphere (m, 100 mm diameter)
-    contact_start_pos: float = 0.080            # Rod position where initial contact occurs x_0 (m)
-    # Mechanistic cutting force coefficients for Inconel 718 (identified / calibrated):
+    contact_start_pos: float = 0.015            # Rod position where initial contact occurs x_0 (15 mm)
+    # Mechanistic cutting force coefficients for Inconel 718:
     k_tc: float = 3100.0e6                      # Tangential shear coefficient K_tc (N/m^2 = Pa)
     k_te: float = 65.0e3                        # Tangential edge coefficient K_te (N/m)
     k_rc: float = 1350.0e6                      # Radial shear coefficient K_rc (N/m^2)
@@ -35,19 +37,38 @@ class CuttingParameters:
 class MechanisticCuttingSubsystem:
     """
     Simulates cutting force, spindle torque, and material removal during milling.
+    Features realistic non-uniform material hardness spots, chip buildup surges, and vibration.
     """
 
-    def __init__(self, params: CuttingParameters = CuttingParameters()) -> None:
+    def __init__(self, params: CuttingParameters = CuttingParameters(), seed: int = 42) -> None:
         self.params = params
+        self.seed = seed
+        self.rng = random.Random(seed)
+
         self.cumulative_volume_removed = 0.0
         self.penetration_depth = 0.0
         self.spindle_angle = 0.0
+        self.sim_time = 0.0
+
+        # Physical disturbance generators:
+        self.chip_packing_level = 0.0           # Chip packing accumulation (0.0 to 1.5)
+        self.hard_spot_active = False
+        self.hard_spot_timer = 0.0
+        self.next_hard_spot_time = 1.5          # First hard inclusion occurs at ~1.5s
+        self.vibration_phase = 0.0
 
     def reset(self) -> None:
         """Reset cutting and workpiece crater states."""
+        self.rng = random.Random(self.seed)
         self.cumulative_volume_removed = 0.0
         self.penetration_depth = 0.0
         self.spindle_angle = 0.0
+        self.sim_time = 0.0
+        self.chip_packing_level = 0.0
+        self.hard_spot_active = False
+        self.hard_spot_timer = 0.0
+        self.next_hard_spot_time = 1.5
+        self.vibration_phase = 0.0
 
     def compute_engagement_geometry(self, rod_position: float) -> Tuple[float, float]:
         """
@@ -62,17 +83,57 @@ class MechanisticCuttingSubsystem:
         r_b = self.params.cutter_radius
 
         # Projected contact area: spherical cap intersection bounded by cutter radius
-        # Cap surface area projection = pi * (2*R_s*d - d^2)
         if d < r_s:
             a_geom = math.pi * (2.0 * r_s * d - d * d)
         else:
             a_geom = math.pi * (r_s * r_s)
 
-        # Bounded by flat cylindrical cutter face area
         a_max = math.pi * (r_b * r_b)
         a_contact = min(a_geom, a_max)
 
         return d, a_contact
+
+    def _update_material_disturbances(self, dt: float, in_contact: bool, v_feed: float) -> Tuple[float, float]:
+        """
+        Simulate Inconel 718 hard precipitate inclusions and non-ideal chip clogging/bursts.
+        Returns: (hardness_multiplier, chip_clog_torque_surge)
+        """
+        self.sim_time += dt
+
+        if not in_contact:
+            self.chip_packing_level = 0.0
+            return 1.0, 0.0
+
+        # 1. Hard Spot (NbC/TiC Carbide Precipitate Cluster)
+        hard_mult = 1.0 + 0.08 * math.sin(19.2 * self.sim_time) + 0.05 * math.sin(7.3 * self.penetration_depth * 1000.0)
+
+        if not self.hard_spot_active and self.sim_time >= self.next_hard_spot_time:
+            self.hard_spot_active = True
+            self.hard_spot_timer = 0.0
+
+        if self.hard_spot_active:
+            self.hard_spot_timer += dt
+            # Intense localized hard spot surge (+65% hardness)
+            hard_mult += 0.65
+            if self.hard_spot_timer >= 0.20:    # Lasts 200 ms
+                self.hard_spot_active = False
+                self.hard_spot_timer = 0.0
+                # Schedule next inclusion in 1.8 to 3.2 seconds
+                self.next_hard_spot_time = self.sim_time + 1.8 + self.rng.uniform(0.0, 1.4)
+
+        # 2. Non-Ideal Chip Removal / Flute Jamming & Burst Release
+        if v_feed > 0:
+            self.chip_packing_level += 2.2 * dt * (v_feed / 0.001)
+
+        chip_clog_surge = 0.0
+        if self.chip_packing_level > 0.8:
+            # Flute gullet fills with sticky Inconel chips -> exponential torque surge
+            chip_clog_surge = 1.4 * (self.chip_packing_level - 0.8)
+            if self.chip_packing_level >= 1.5:
+                # Sudden chip evacuation / burst release!
+                self.chip_packing_level = 0.0
+
+        return hard_mult, chip_clog_surge
 
     def step_level_a_averaged(
         self,
@@ -82,18 +143,20 @@ class MechanisticCuttingSubsystem:
         spindle_speed: float,
     ) -> Tuple[float, float, float, float]:
         """
-        Level A (Control-Oriented): Revolution-averaged cutting forces.
+        Level A (Control-Oriented): Revolution-averaged cutting forces with realistic disturbances.
         Returns: (axial_force, cutting_torque, mrr, chip_thickness)
         """
         d, a_contact = self.compute_engagement_geometry(rod_position)
         self.penetration_depth = d
 
-        if d <= 0.0 or a_contact <= 0.0:
-            return 0.0, 0.0, 0.0, 0.0
-
-        # Positive feed advances cut into material
+        in_contact = (d > 0.0 and a_contact > 0.0)
         v_feed = max(0.0, rod_velocity)
         omega = max(1.0, abs(spindle_speed))
+
+        hard_mult, clog_surge = self._update_material_disturbances(dt, in_contact, v_feed)
+
+        if not in_contact:
+            return 0.0, 0.0, 0.0, 0.0
 
         # Material Removal Rate: MRR = A_contact * v_feed
         mrr = a_contact * v_feed
@@ -104,13 +167,20 @@ class MechanisticCuttingSubsystem:
         n_rev = omega / (2.0 * math.pi)
         h_avg = v_feed / (self.params.flute_count * n_rev)
 
-        # Spindle Cutting Torque: Power = Specific_Energy * MRR -> Torque = Power / omega
-        t_cutting = (self.params.averaged_specific_energy * mrr) / omega + self.params.rubbing_torque_coeff * a_contact
+        # 3. Mechanical vibration & tooth-passing noise
+        self.vibration_phase = (self.vibration_phase + self.params.flute_count * omega * dt) % (2.0 * math.pi)
+        t_vib = 0.35 * math.sin(self.vibration_phase) + self.rng.gauss(0.0, 0.08)
+        f_vib = 40.0 * math.cos(self.vibration_phase) + self.rng.gauss(0.0, 15.0)
 
-        # Axial Reaction Force (WOB): Area thrust + dynamic feed resistance
-        f_axial = self.params.axial_thrust_coeff * a_contact + self.params.axial_damping * v_feed
+        # Base cutting torque with hardness and chip clog scaling
+        base_torque = (self.params.averaged_specific_energy * hard_mult * (1.0 + clog_surge) * mrr) / omega
+        t_cutting = base_torque + self.params.rubbing_torque_coeff * a_contact * hard_mult + t_vib
 
-        return f_axial, t_cutting, mrr, h_avg
+        # Axial Reaction Force (WOB)
+        base_axial = self.params.axial_thrust_coeff * hard_mult * (1.0 + 0.35 * clog_surge) * a_contact
+        f_axial = base_axial + self.params.axial_damping * v_feed + f_vib
+
+        return max(0.0, f_axial), max(0.0, t_cutting), mrr, h_avg
 
     def step_level_b_tooth_resolved(
         self,
@@ -126,11 +196,15 @@ class MechanisticCuttingSubsystem:
         d, a_contact = self.compute_engagement_geometry(rod_position)
         self.penetration_depth = d
 
-        if d <= 0.0 or a_contact <= 0.0:
-            return 0.0, 0.0, 0.0, 0.0
-
+        in_contact = (d > 0.0 and a_contact > 0.0)
         v_feed = max(0.0, rod_velocity)
         omega = max(1.0, abs(spindle_speed))
+
+        hard_mult, clog_surge = self._update_material_disturbances(dt, in_contact, v_feed)
+
+        if not in_contact:
+            return 0.0, 0.0, 0.0, 0.0
+
         self.spindle_angle = (self.spindle_angle + omega * dt) % (2.0 * math.pi)
 
         z_flutes = self.params.flute_count
@@ -138,7 +212,6 @@ class MechanisticCuttingSubsystem:
         n_rev = omega / (2.0 * math.pi)
         feed_per_tooth = v_feed / (z_flutes * n_rev)
 
-        # Axial depth of cut slice
         axial_depth = min(d, r_b)
         dz = max(1.0e-4, axial_depth / 5.0)
 
@@ -146,10 +219,8 @@ class MechanisticCuttingSubsystem:
         total_axial_force = 0.0
         max_h = 0.0
 
-        # Sum contributions over all flutes and axial slices
         for j in range(z_flutes):
             flute_angle = self.spindle_angle + j * (2.0 * math.pi / z_flutes)
-            # Runout eccentricity
             r_eff = r_b + self.params.runout_amplitude * math.cos(j * (2.0 * math.pi / z_flutes))
 
             for z_idx in range(5):
@@ -157,14 +228,13 @@ class MechanisticCuttingSubsystem:
                 helix_lag = (z_curr * math.tan(math.radians(self.params.helix_angle_deg))) / r_b
                 phi = (flute_angle - helix_lag) % (2.0 * math.pi)
 
-                # Active immersion window (approximate plunge entry: 0 to pi)
                 if 0.0 < phi < math.pi:
                     h_inst = feed_per_tooth * math.sin(phi)
                     if h_inst > max_h:
                         max_h = h_inst
 
-                    df_t = (self.params.k_tc * h_inst + self.params.k_te) * dz
-                    df_a = (self.params.k_ac * h_inst + self.params.k_ae) * dz
+                    df_t = (self.params.k_tc * hard_mult * (1.0 + clog_surge) * h_inst + self.params.k_te) * dz
+                    df_a = (self.params.k_ac * hard_mult * h_inst + self.params.k_ae) * dz
 
                     total_torque += df_t * r_eff
                     total_axial_force += df_a
@@ -172,8 +242,7 @@ class MechanisticCuttingSubsystem:
         mrr = a_contact * v_feed
         self.cumulative_volume_removed += mrr * dt
 
-        # Add static rubbing and contact resistance
-        total_axial_force += self.params.axial_thrust_coeff * a_contact * 0.4
+        total_axial_force += self.params.axial_thrust_coeff * hard_mult * a_contact * 0.4
         total_torque += self.params.rubbing_torque_coeff * a_contact * 0.4
 
-        return total_axial_force, total_torque, mrr, max_h
+        return max(0.0, total_axial_force), max(0.0, total_torque), mrr, max_h

@@ -56,9 +56,11 @@ class SupervisoryStateMachine:
         """
         self.mode_timer += dt
 
-        # Global critical check: impending stall
-        if spindle_rpm < self.nominal_spindle_rpm * 0.35 and self.current_mode != OperatingMode.APPROACH:
+        # Impending stall check: only valid if in contact with load
+        is_in_cut = (torque_est_nm > 1.2 or wob_est_n > 50.0)
+        if is_in_cut and spindle_rpm < self.nominal_spindle_rpm * 0.35 and self.current_mode != OperatingMode.APPROACH:
             self.current_mode = OperatingMode.STALL_RECOVERY
+            self.mode_timer = 0.0
             return self.current_mode
 
         if self.current_mode == OperatingMode.APPROACH:
@@ -100,8 +102,8 @@ class SupervisoryStateMachine:
                 self.mode_timer = 0.0
 
         elif self.current_mode == OperatingMode.STALL_RECOVERY:
-            # Manual or sequenced recover
-            if spindle_rpm > self.nominal_spindle_rpm * 0.85:
+            # Automated recovery: spindle spins up while pump is zeroed
+            if spindle_rpm > self.nominal_spindle_rpm * 0.70 or self.mode_timer > 1.5:
                 self.current_mode = OperatingMode.PRESSURE_RELAXATION
                 self.mode_timer = 0.0
 

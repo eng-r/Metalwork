@@ -21,9 +21,9 @@ class HydraulicParameters:
     bypass_orifice_cd_a: float = 6.0e-10         # C_bypass stiff calibrated orifice area (m^2)
     seal_leakage_coeff: float = 2.0e-14         # C_leak parasitic seal conductance (m^3/(s*Pa))
     # Centrifugal pump head-flow coefficients: delta_P = a0*w^2 - a1*w*Q - a2*Q^2
-    pump_a0: float = 0.42                       # Pa / (rad/s)^2 (gives ~67 bar at 4000 RPM)
-    pump_a1: float = 8.5e4                      # Pa / ((rad/s) * (m^3/s))
-    pump_a2: float = 4.5e9                      # Pa / (m^3/s)^2
+    pump_a0: float = 38.0                       # Pa / (rad/s)^2 (gives ~66.7 bar at 4000 RPM)
+    pump_a1: float = 8.5e6                      # Pa / ((rad/s) * (m^3/s))
+    pump_a2: float = 4.5e12                     # Pa / (m^3/s)^2
 
 
 class HydraulicSubsystem:

@@ -188,13 +188,13 @@ class CascadeLADRCController(IController):
             pump_rpm_cmd = self.last_pump_cmd_rpm - max_down
 
         self.last_pump_cmd_rpm = pump_rpm_cmd
-        spindle_rpm_cmd = self.spindle_rpm_nominal if self.current_mode != OperatingMode.STALL_RECOVERY else 0.0
+        spindle_rpm_cmd = self.spindle_rpm_nominal
 
         return ControlCommands(
             timestamp=sensors.timestamp,
             pump_speed_cmd_rpm=pump_rpm_cmd,
             spindle_speed_cmd_rpm=spindle_rpm_cmd,
-            enable_pump=(self.current_mode != OperatingMode.STALL_RECOVERY),
+            enable_pump=(self.current_mode not in (OperatingMode.STALL_RECOVERY, OperatingMode.PRESSURE_RELAXATION, OperatingMode.OVERLOAD_RECOVERY)),
             enable_spindle=True,
         )
 
