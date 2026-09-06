@@ -1,17 +1,30 @@
 import React, { useState } from 'react';
 import { Sliders, RefreshCw, Check } from 'lucide-react';
 import { telemetryClient } from '../services/socket';
+import {
+  barToPsi,
+  ftLbfToNm,
+  psiToBar,
+} from '../utils/units';
 
 interface ControlPanelProps {
   currentController: string;
   onConfigApplied?: () => void;
 }
 
-export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, onConfigApplied }) => {
+export const ControlPanel: React.FC<ControlPanelProps> = ({
+  currentController,
+  onConfigApplied,
+}) => {
   const [controllerType, setControllerType] = useState<string>(
-    currentController.toLowerCase().includes('pid') ? 'pid' : 'adrc'
+    currentController.toLowerCase().includes('pid') ? 'pid' : 'adrc',
   );
-  const [targetPressure, setTargetPressure] = useState<number>(35.0);
+
+  // Operator-facing units only. Convert back to backend engineering units on apply.
+  const [targetToBFtLbf, setTargetToBFtLbf] = useState<number>(3.0);
+  const [pressureCeilingPsi, setPressureCeilingPsi] = useState<number>(
+    barToPsi(35.0),
+  );
   const [spindleRpm, setSpindleRpm] = useState<number>(3500.0);
   const [hardnessHrc, setHardnessHrc] = useState<number>(42.0);
   const [bypassScale, setBypassScale] = useState<number>(1.0);
@@ -20,7 +33,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
   const handleApply = async () => {
     await telemetryClient.updateConfig({
       controller_type: controllerType,
-      target_pressure_bar: targetPressure,
+      target_pressure_bar: psiToBar(pressureCeilingPsi),
+      target_torque_nm: ftLbfToNm(targetToBFtLbf),
       spindle_rpm_nominal: spindleRpm,
       material_hardness_hrc: hardnessHrc,
       bypass_orifice_area_scale: bypassScale,
@@ -39,7 +53,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
             CONTROL LAW & PHYSICAL PLANT TUNING
           </h2>
           <p className="text-xs text-slate-500 font-mono mt-0.5">
-            Configure discrete controller parameters, material properties, and hydraulic stiffness.
+            ToB is the primary operator setpoint; pressure is a hydraulic ceiling.
           </p>
         </div>
         <button
@@ -50,13 +64,16 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
               : 'bg-primary hover:bg-primary-dark text-white'
           }`}
         >
-          {saved ? <Check className="w-3.5 h-3.5" /> : <RefreshCw className="w-3.5 h-3.5" />}
+          {saved ? (
+            <Check className="w-3.5 h-3.5" />
+          ) : (
+            <RefreshCw className="w-3.5 h-3.5" />
+          )}
           {saved ? 'APPLIED' : 'APPLY CONFIGURATION'}
         </button>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {/* Section 1: Controller Architecture */}
         <div className="space-y-4">
           <label className="block text-xs font-mono font-bold uppercase text-slate-700">
             Control Algorithm Architecture
@@ -70,9 +87,11 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
                   : 'border-border bg-slate-50/50 hover:bg-slate-100/60'
               }`}
             >
-              <div className="font-semibold text-xs text-slate-900">Cascade LADRC</div>
+              <div className="font-semibold text-xs text-slate-900">
+                Cascade LADRC
+              </div>
               <div className="text-[10px] text-slate-500 mt-1">
-                3rd-order LESO with Asymmetric Reference Governor. Total disturbance rejection.
+                ToB governor → LADRC pressure loop → pump command.
               </div>
             </button>
             <button
@@ -83,33 +102,66 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
                   : 'border-border bg-slate-50/50 hover:bg-slate-100/60'
               }`}
             >
-              <div className="font-semibold text-xs text-slate-900">Baseline PID</div>
+              <div className="font-semibold text-xs text-slate-900">
+                Baseline PID
+              </div>
               <div className="text-[10px] text-slate-500 mt-1">
-                Gain-scheduled PI/PID with conditional tracking anti-windup.
+                Same ToB governor → PID pressure loop → pump command.
               </div>
             </button>
           </div>
 
           <div className="pt-2">
             <div className="flex justify-between text-xs font-mono text-slate-700 mb-1">
-              <span>TARGET CUTTING PRESSURE</span>
-              <span className="font-bold text-primary">{targetPressure.toFixed(1)} bar</span>
+              <span>DESIRED TORQUE ON BIT (ToB)</span>
+              <span className="font-bold text-primary">
+                {targetToBFtLbf.toFixed(1)} ft·lbf
+              </span>
             </div>
             <input
               type="range"
-              min="15.0"
-              max="60.0"
-              step="1.0"
-              value={targetPressure}
-              onChange={(e) => setTargetPressure(parseFloat(e.target.value))}
+              min="1.0"
+              max="5.0"
+              step="0.1"
+              value={targetToBFtLbf}
+              onChange={(e) => setTargetToBFtLbf(parseFloat(e.target.value))}
               className="w-full accent-primary h-1.5 bg-slate-200 rounded"
             />
+            <div className="text-[10px] text-slate-400 font-mono mt-1">
+              Primary milling-load setpoint used by both PID and LADRC comparisons.
+            </div>
+          </div>
+
+          <div>
+            <div className="flex justify-between text-xs font-mono text-slate-700 mb-1">
+              <span>HYDRAULIC PRESSURE CEILING</span>
+              <span className="font-bold text-primary">
+                {pressureCeilingPsi.toFixed(0)} psi
+              </span>
+            </div>
+            <input
+              type="range"
+              min="250"
+              max="850"
+              step="25"
+              value={pressureCeilingPsi}
+              onChange={(e) =>
+                setPressureCeilingPsi(parseFloat(e.target.value))
+              }
+              className="w-full accent-primary h-1.5 bg-slate-200 rounded"
+            />
+            <div className="text-[10px] text-slate-400 font-mono mt-1">
+              Safety/authority limit. The controller varies pressure below this ceiling
+              to track desired ToB.
+            </div>
           </div>
 
           <div>
             <div className="flex justify-between text-xs font-mono text-slate-700 mb-1">
               <span>NOMINAL SPINDLE SPEED</span>
-              <span className="font-bold text-primary">{spindleRpm.toFixed(0)} RPM</span>
+              <span className="font-bold text-primary">
+                {spindleRpm.toFixed(0)} RPM
+              </span>
             </div>
             <input
               type="range"
@@ -123,7 +175,6 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
           </div>
         </div>
 
-        {/* Section 2: Physical Workpiece & Hydraulic Parameters */}
         <div className="space-y-4">
           <label className="block text-xs font-mono font-bold uppercase text-slate-700">
             Workpiece & Plant Physics
@@ -132,7 +183,9 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
           <div>
             <div className="flex justify-between text-xs font-mono text-slate-700 mb-1">
               <span>INCONEL 718 HARDNESS</span>
-              <span className="font-bold text-slate-900">{hardnessHrc.toFixed(1)} HRC</span>
+              <span className="font-bold text-slate-900">
+                {hardnessHrc.toFixed(1)} HRC
+              </span>
             </div>
             <input
               type="range"
@@ -143,15 +196,14 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
               onChange={(e) => setHardnessHrc(parseFloat(e.target.value))}
               className="w-full accent-slate-700 h-1.5 bg-slate-200 rounded"
             />
-            <div className="text-[10px] text-slate-400 font-mono mt-1">
-              Scales specific cutting energy k_c from 2700 MPa to 3700 MPa.
-            </div>
           </div>
 
           <div>
             <div className="flex justify-between text-xs font-mono text-slate-700 mb-1">
               <span>CALIBRATED BYPASS ORIFICE SCALE</span>
-              <span className="font-bold text-slate-900">{bypassScale.toFixed(2)}x</span>
+              <span className="font-bold text-slate-900">
+                {bypassScale.toFixed(2)}x
+              </span>
             </div>
             <input
               type="range"
@@ -163,8 +215,14 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({ currentController, o
               className="w-full accent-slate-700 h-1.5 bg-slate-200 rounded"
             />
             <div className="text-[10px] text-slate-400 font-mono mt-1">
-              Modulates passive pressure relaxation rate through calibrated leak.
+              Modulates passive pressure relaxation rate through the calibrated leak.
             </div>
+          </div>
+
+          <div className="rounded border border-amber-200 bg-amber-50/60 p-3 text-[10px] text-amber-900 font-mono leading-relaxed">
+            Slow material removal is time-compressed for the workstation demo.
+            Force, pressure, motor, observer and controller equations continue to run
+            on the normal simulation clock.
           </div>
         </div>
       </div>

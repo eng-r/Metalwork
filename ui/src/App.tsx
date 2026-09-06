@@ -1,20 +1,35 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Pause, RotateCcw, SkipForward, AlertOctagon, Download } from 'lucide-react';
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  SkipForward,
+  AlertOctagon,
+  Download,
+} from 'lucide-react';
 import { Sidebar, TabType } from './components/Sidebar';
 import { MetricCard } from './components/MetricCard';
 import { Viewport3D } from './components/Viewport3D';
 import { TelemetryCharts } from './components/TelemetryCharts';
 import { ControlPanel } from './components/ControlPanel';
 import { telemetryClient, TelemetryData } from './services/socket';
+import {
+  barToPsi,
+  formatDuration,
+  mpsToMmPerMin,
+  newtonToLbf,
+  nmToFtLbf,
+} from './utils/units';
 
 interface ChartPoint {
   t: number;
   pressure: number;
   torque: number;
+  targetTorque: number;
   wob: number;
   spindleRpm: number;
   pumpRpm: number;
-  depth: number;
+  ropMps: number;
 }
 
 export const App: React.FC = () => {
@@ -23,6 +38,7 @@ export const App: React.FC = () => {
     timestamp: 0.0,
     is_running: false,
     operating_mode: 'APPROACH',
+    controller_type: 'CascadeLADRC',
     pressure_bar: 1.01,
     pressure_true_bar: 1.01,
     spindle_rpm: 0.0,
@@ -30,6 +46,7 @@ export const App: React.FC = () => {
     pump_cmd_rpm: 0.0,
     spindle_torque_est: 0.0,
     spindle_torque_true: 0.0,
+    target_torque_nm: 4.0,
     wob_soft_sensor: 0.0,
     axial_cutting_force_true: 0.0,
     rod_position_mm: 0.0,
@@ -38,6 +55,11 @@ export const App: React.FC = () => {
     cumulative_volume_mm3: 0.0,
     seal_friction_n: 0.0,
     leso_z3_disturbance: 0.0,
+    physical_rop_m_s: 0.0,
+    surface_recession_m: 0.0,
+    demo_acceleration: 120.0,
+    equivalent_process_time_s: 0.0,
+    disturbance_event: 'FREE',
   });
 
   const [chartHistory, setChartHistory] = useState<ChartPoint[]>([]);
@@ -50,13 +72,18 @@ export const App: React.FC = () => {
           t: data.timestamp,
           pressure: data.pressure_bar,
           torque: data.spindle_torque_est,
+          targetTorque: data.target_torque_nm,
           wob: data.wob_soft_sensor,
           spindleRpm: data.spindle_rpm,
           pumpRpm: data.pump_rpm,
-          depth: data.penetration_depth_mm,
+          ropMps: data.physical_rop_m_s,
         };
         const updated = [...prev, nextPt];
-        return updated.length > 250 ? updated.slice(updated.length - 250) : updated;
+
+        // 4x previous browser chart memory (250 -> 1000 samples).
+        return updated.length > 1000
+          ? updated.slice(updated.length - 1000)
+          : updated;
       });
     });
 
@@ -77,33 +104,50 @@ export const App: React.FC = () => {
     }
   };
 
+  const physicalRop = mpsToMmPerMin(telemetry.physical_rop_m_s);
+
   return (
     <div className="flex h-screen w-screen bg-background overflow-hidden font-sans">
-      {/* Left Sidebar Navigation */}
       <Sidebar
         activeTab={activeTab}
         onSelectTab={setActiveTab}
-        controllerType="Cascade LADRC"
+        controllerType={telemetry.controller_type}
       />
 
-      {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-screen overflow-y-auto">
-        {/* Top Control Bar */}
         <header className="h-16 bg-card border-b border-border px-8 flex items-center justify-between shrink-0 sticky top-0 z-20 shadow-sm">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 font-mono text-xs">
-              <span className="text-slate-400">VIRTUAL TIME:</span>
+          <div className="flex items-center gap-3 font-mono text-[11px]">
+            <div className="flex items-center gap-2">
+              <span className="text-slate-400">DEMO TIME:</span>
               <span className="font-bold text-slate-900 bg-slate-100 px-2 py-1 rounded">
-                {telemetry.timestamp.toFixed(3)} s
+                {telemetry.timestamp.toFixed(2)} s
               </span>
             </div>
 
-            <div className={`px-2.5 py-0.5 rounded-full border text-[11px] font-mono font-semibold tracking-wide ${getModeBadgeClass(telemetry.operating_mode)}`}>
+            <div className="px-2 py-1 rounded border border-violet-200 bg-violet-50 text-violet-700 font-bold">
+              {telemetry.demo_acceleration.toFixed(0)}× MATERIAL-TIME
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="text-slate-400">EQUIV. CUT TIME:</span>
+              <span className="font-bold text-slate-800">
+                {formatDuration(telemetry.equivalent_process_time_s)}
+              </span>
+            </div>
+
+            <div
+              className={`px-2.5 py-0.5 rounded-full border font-semibold tracking-wide ${getModeBadgeClass(
+                telemetry.operating_mode,
+              )}`}
+            >
               {telemetry.operating_mode}
+            </div>
+
+            <div className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">
+              {telemetry.disturbance_event}
             </div>
           </div>
 
-          {/* Action Buttons */}
           <div className="flex items-center gap-2">
             {!telemetry.is_running ? (
               <button
@@ -152,31 +196,38 @@ export const App: React.FC = () => {
           </div>
         </header>
 
-        {/* Tab Views */}
         <div className="p-8 space-y-6 flex-1">
           {activeTab === 'monitor' && (
             <>
-              {/* KPI Strip */}
               <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-4">
                 <MetricCard
                   label="Pressure P"
-                  value={telemetry.pressure_bar.toFixed(1)}
-                  unit="bar"
-                  subValue={`True: ${telemetry.pressure_true_bar.toFixed(1)} bar`}
+                  value={barToPsi(telemetry.pressure_bar).toFixed(0)}
+                  unit="psi"
+                  subValue={`True: ${barToPsi(
+                    telemetry.pressure_true_bar,
+                  ).toFixed(0)} psi`}
                   highlight
                 />
                 <MetricCard
                   label="Weight On Bit"
-                  value={telemetry.wob_soft_sensor.toFixed(0)}
-                  unit="N"
-                  subValue={`True: ${telemetry.axial_cutting_force_true.toFixed(0)} N`}
+                  value={newtonToLbf(telemetry.wob_soft_sensor).toFixed(0)}
+                  unit="lbf"
+                  subValue={`True: ${newtonToLbf(
+                    telemetry.axial_cutting_force_true,
+                  ).toFixed(0)} lbf`}
                 />
                 <MetricCard
-                  label="Spindle Torque"
-                  value={telemetry.spindle_torque_est.toFixed(2)}
-                  unit="N·m"
-                  subValue="Iq observer"
-                  highlight={telemetry.spindle_torque_est > 6.5}
+                  label="Torque On Bit"
+                  value={nmToFtLbf(telemetry.spindle_torque_est).toFixed(2)}
+                  unit="ft·lbf"
+                  subValue={`SP: ${nmToFtLbf(
+                    telemetry.target_torque_nm,
+                  ).toFixed(2)} ft·lbf`}
+                  highlight={
+                    telemetry.spindle_torque_est >
+                    telemetry.target_torque_nm * 1.35
+                  }
                 />
                 <MetricCard
                   label="Spindle Speed"
@@ -191,10 +242,12 @@ export const App: React.FC = () => {
                   subValue={`Cmd: ${telemetry.pump_cmd_rpm.toFixed(0)}`}
                 />
                 <MetricCard
-                  label="Crater Depth"
-                  value={telemetry.penetration_depth_mm.toFixed(2)}
-                  unit="mm"
-                  subValue={`Rod: ${telemetry.rod_position_mm.toFixed(1)} mm`}
+                  label="Physical ROP"
+                  value={physicalRop.toFixed(3)}
+                  unit="mm/min"
+                  subValue={`Eq. cut: ${(
+                    telemetry.surface_recession_m * 1000.0
+                  ).toFixed(2)} mm`}
                 />
                 <MetricCard
                   label="LESO Total Dist."
@@ -204,9 +257,20 @@ export const App: React.FC = () => {
                 />
               </div>
 
-              {/* Main Dual Workspace Grid */}
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-[500px]">
-                <div className="lg:col-span-5 h-[520px]">
+              <div className="rounded border border-violet-200 bg-violet-50/60 px-4 py-3 text-[11px] font-mono text-violet-900 flex flex-wrap gap-x-6 gap-y-1">
+                <span className="font-bold">ACCELERATED PROCESS DEMO</span>
+                <span>
+                  ROP shown is the physical rate. Only slow material/crater evolution
+                  is time-compressed {telemetry.demo_acceleration.toFixed(0)}× so
+                  hours of Inconel milling are observable in minutes.
+                </span>
+                <span>
+                  Nominal 0.08 mm/min ⇒ 3–4 in requires roughly 16–21 h actual cutting.
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-[650px]">
+                <div className="lg:col-span-5 h-[650px]">
                   <Viewport3D
                     rodPositionMm={telemetry.rod_position_mm}
                     penetrationDepthMm={telemetry.penetration_depth_mm}
@@ -215,7 +279,7 @@ export const App: React.FC = () => {
                     wobN={telemetry.wob_soft_sensor}
                   />
                 </div>
-                <div className="lg:col-span-7 h-[520px]">
+                <div className="lg:col-span-7 h-[650px]">
                   <TelemetryCharts history={chartHistory} />
                 </div>
               </div>
@@ -224,7 +288,7 @@ export const App: React.FC = () => {
 
           {activeTab === 'tuning' && (
             <div className="flex justify-center">
-              <ControlPanel currentController="Cascade LADRC" />
+              <ControlPanel currentController={telemetry.controller_type} />
             </div>
           )}
 
@@ -252,32 +316,32 @@ export const App: React.FC = () => {
                   </thead>
                   <tbody className="divide-y divide-border">
                     <tr>
-                      <td className="p-3 font-semibold">k_c (Specific Cutting Energy)</td>
-                      <td className="p-3 text-slate-500">Inconel 718 Mechanics</td>
-                      <td className="p-3 text-right font-bold text-primary">3180.4 MPa</td>
+                      <td className="p-3 font-semibold">
+                        k_c (Specific Cutting Energy)
+                      </td>
+                      <td className="p-3 text-slate-500">
+                        Inconel 718 Mechanics
+                      </td>
+                      <td className="p-3 text-right font-bold text-primary">
+                        3180.4 MPa
+                      </td>
                       <td className="p-3 text-right">3200.0 MPa</td>
-                      <td className="p-3 text-right text-emerald-600 font-bold">Passed (0.6%)</td>
+                      <td className="p-3 text-right text-emerald-600 font-bold">
+                        Passed (0.6%)
+                      </td>
                     </tr>
                     <tr>
-                      <td className="p-3 font-semibold">k_ax (Axial Thrust Coeff)</td>
+                      <td className="p-3 font-semibold">
+                        k_ax (Axial Thrust Coeff)
+                      </td>
                       <td className="p-3 text-slate-500">Contact Thrust</td>
-                      <td className="p-3 text-right font-bold text-primary">18.00 MPa</td>
+                      <td className="p-3 text-right font-bold text-primary">
+                        18.00 MPa
+                      </td>
                       <td className="p-3 text-right">18.00 MPa</td>
-                      <td className="p-3 text-right text-emerald-600 font-bold">Passed (0.0%)</td>
-                    </tr>
-                    <tr>
-                      <td className="p-3 font-semibold">a_0 (Pump Shutoff Head)</td>
-                      <td className="p-3 text-slate-500">Centrifugal Hydraulics</td>
-                      <td className="p-3 text-right font-bold text-primary">0.420 Pa/(rad/s)²</td>
-                      <td className="p-3 text-right">0.420 Pa/(rad/s)²</td>
-                      <td className="p-3 text-right text-emerald-600 font-bold">Passed (0.1%)</td>
-                    </tr>
-                    <tr>
-                      <td className="p-3 font-semibold">C_bypass (Calibrated Orifice)</td>
-                      <td className="p-3 text-slate-500">Hydraulic Relaxation</td>
-                      <td className="p-3 text-right font-bold text-primary">6.00e-10 m²</td>
-                      <td className="p-3 text-right">6.00e-10 m²</td>
-                      <td className="p-3 text-right text-emerald-600 font-bold">Passed (0.0%)</td>
+                      <td className="p-3 text-right text-emerald-600 font-bold">
+                        Passed (0.0%)
+                      </td>
                     </tr>
                   </tbody>
                 </table>
@@ -292,7 +356,8 @@ export const App: React.FC = () => {
                   SCIENTIFIC & PRESENTATION EXPORT CENTER
                 </h2>
                 <p className="text-xs text-slate-500 font-mono mt-0.5">
-                  Export publication-grade raw data and publication artifacts.
+                  Backend exports remain in engineering/SI units; US-customary
+                  conversions are UI-only.
                 </p>
               </div>
 
@@ -307,19 +372,18 @@ export const App: React.FC = () => {
                     Download Telemetry CSV
                   </div>
                   <p className="text-xs text-slate-500 font-mono mt-2">
-                    Full virtual-time records including pressure, torque, WOB, RPM, and crater volume.
+                    Pressure, ToB, WOB, physical ROP and disturbance event history.
                   </p>
                 </a>
 
                 <div className="p-5 border border-border rounded bg-slate-50/50 flex flex-col justify-between">
                   <div className="text-slate-900 font-bold text-sm">
-                    Pre-rendered Publication Figures
+                    Display convention
                   </div>
                   <p className="text-xs text-slate-500 font-mono mt-2">
-                    Generated via headless runner: <br />
-                    <code className="text-primary font-bold">figures/test_run.png</code>
+                    UI: psi, lbf, ft·lbf, mm/min
                     <br />
-                    <code className="text-primary font-bold">figures/benchmark_comparison.png</code>
+                    Backend/controller: SI / existing engineering units
                   </p>
                 </div>
               </div>

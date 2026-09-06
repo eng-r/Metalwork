@@ -33,17 +33,21 @@ class CuttingParameters:
     # Level-A control-oriented coefficients.
     averaged_specific_energy: float = 3.2e9
     axial_thrust_coeff: float = 1.8e7
-    rubbing_torque_coeff: float = 1200.0
+    rubbing_torque_coeff: float = 13000.0    # calibrated edge/engagement torque term
     axial_damping: float = 800.0
 
     # Level-B runout.
     runout_amplitude: float = 1.5e-5
 
-    # Material-removal / dwell-clearing dynamics.
+    # Slow physical material-removal model.
+    # ~0.08 mm/min gives about 16 h for 3 in and 21 h for 4 in at nominal conditions.
+    # Only material geometry is time-compressed for the interactive demo.
     nominal_spindle_rpm: float = 3500.0
-    clearing_time_constant: float = 0.55
-    feed_capture_ratio: float = 0.30
-    max_surface_advance_rate: float = 0.0030
+    nominal_physical_rop_mm_min: float = 0.08
+    min_physical_rop_mm_min: float = 0.01
+    max_physical_rop_mm_min: float = 0.16
+    demo_acceleration: float = 120.0
+    engagement_scale: float = 0.00025
 
     # Spatial material non-uniformity.
     material_texture_amplitude: float = 0.07
@@ -90,6 +94,8 @@ class MechanisticCuttingSubsystem:
         self.engagement_depth = 0.0
         self.spindle_angle = 0.0
         self.sim_time = 0.0
+        self.physical_rop_m_s = 0.0
+        self.equivalent_process_time = 0.0
 
         self.hardness_multiplier = 1.0
         self.chip_packing_level = 0.0
@@ -132,6 +138,8 @@ class MechanisticCuttingSubsystem:
         self.engagement_depth = 0.0
         self.spindle_angle = 0.0
         self.sim_time = 0.0
+        self.physical_rop_m_s = 0.0
+        self.equivalent_process_time = 0.0
         self.hardness_multiplier = 1.0
         self.chip_packing_level = 0.0
         self.chip_jam_active = False
@@ -183,25 +191,65 @@ class MechanisticCuttingSubsystem:
         spindle_speed: float,
         hardness: float,
     ) -> Tuple[float, float]:
+        """
+        Advance crater geometry at accelerated demo time while preserving a
+        physically slow ROP for cutting power, telemetry and reporting.
+
+        Returns:
+            physical_mrr [m^3/s], physical_rop [m/s]
+        """
         if engagement_depth <= 0.0 or contact_area <= 0.0 or abs(spindle_speed) < 5.0:
+            self.physical_rop_m_s = 0.0
             return 0.0, 0.0
-        speed_ref = self.params.nominal_spindle_rpm * math.pi / 30.0
-        speed_factor = max(0.05, min(1.35, abs(spindle_speed) / max(speed_ref, 1.0)))
-        feed_component = self.params.feed_capture_ratio * max(0.0, rod_velocity)
-        dwell_component = engagement_depth / max(0.05, self.params.clearing_time_constant)
+
+        p = self.params
+        nominal_rop = p.nominal_physical_rop_mm_min / (1000.0 * 60.0)
+        min_rop = p.min_physical_rop_mm_min / (1000.0 * 60.0)
+        max_rop = p.max_physical_rop_mm_min / (1000.0 * 60.0)
+
+        speed_ref = p.nominal_spindle_rpm * math.pi / 30.0
+        speed_factor = max(
+            0.15,
+            min(1.25, abs(spindle_speed) / max(speed_ref, 1.0)),
+        )
+
+        # More interference raises chip engagement, but saturates quickly; feed
+        # velocity only trims the achievable ROP rather than dictating it.
+        engagement_factor = 0.35 + 0.75 * math.tanh(
+            engagement_depth / max(1.0e-6, p.engagement_scale)
+        )
+        feed_trim = 1.0 + min(
+            0.20,
+            0.10 * max(0.0, rod_velocity) / 0.001,
+        )
+
         chip_efficiency = 1.0 / (1.0 + 0.95 * self.chip_packing_level)
         if self.chip_jam_active:
             chip_efficiency *= 0.38
-        hardness_efficiency = 1.0 / max(0.85, hardness)
-        clear_rate = (feed_component + dwell_component) * speed_factor * chip_efficiency * hardness_efficiency
-        clear_rate = min(self.params.max_surface_advance_rate, max(0.0, clear_rate))
+        hardness_efficiency = 1.0 / max(0.80, hardness ** 1.20)
+
+        physical_rop = (
+            nominal_rop
+            * speed_factor
+            * engagement_factor
+            * feed_trim
+            * chip_efficiency
+            * hardness_efficiency
+        )
+        physical_rop = max(min_rop, min(max_rop, physical_rop))
+        self.physical_rop_m_s = physical_rop
+
+        # Time compression is intentionally restricted to the slow geometry state.
+        demo_surface_rate = physical_rop * max(1.0, p.demo_acceleration)
         clearable = max(0.0, gross_depth - self.surface_recession_depth)
-        delta_clear = min(clearable, clear_rate * dt)
-        actual_rate = delta_clear / max(dt, 1.0e-9)
+        delta_clear = min(clearable, demo_surface_rate * dt)
         self.surface_recession_depth += delta_clear
-        mrr = contact_area * actual_rate
-        self.cumulative_volume_removed += mrr * dt
-        return mrr, actual_rate
+        self.equivalent_process_time += dt * max(1.0, p.demo_acceleration)
+
+        physical_mrr = contact_area * physical_rop
+        equivalent_removed_volume = contact_area * delta_clear
+        self.cumulative_volume_removed += equivalent_removed_volume
+        return physical_mrr, physical_rop
 
     def _update_chip_transport(
         self,
@@ -212,7 +260,10 @@ class MechanisticCuttingSubsystem:
         hardness: float,
     ) -> Tuple[float, bool, bool]:
         area_max = math.pi * self.params.cutter_radius ** 2
-        reference_mrr = max(1.0e-12, area_max * 0.001)
+        nominal_surface_rate = (
+            self.params.nominal_physical_rop_mm_min / (1000.0 * 60.0)
+        )
+        reference_mrr = max(1.0e-15, area_max * nominal_surface_rate)
         mrr_norm = min(3.0, mrr / reference_mrr)
         speed_ref = self.params.nominal_spindle_rpm * math.pi / 30.0
         speed_factor = min(1.5, max(0.0, abs(spindle_speed) / max(speed_ref, 1.0)))
@@ -316,6 +367,7 @@ class MechanisticCuttingSubsystem:
         engagement, area = self.compute_engagement_geometry(rod_position)
         in_contact = engagement > 0.0 and area > 0.0 and abs(spindle_speed) > 5.0
         if not in_contact:
+            self.physical_rop_m_s = 0.0
             self.chip_packing_level = max(0.0, self.chip_packing_level - 0.7 * dt)
             self.hardness_multiplier = self._material_hardness(self.surface_recession_depth)
             self.engagement_depth = engagement

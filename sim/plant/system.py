@@ -43,7 +43,7 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         # Subsystems
         self.hydraulics = HydraulicSubsystem(self.hyd_params)
         self.mechanics = MechanicsSubsystem(self.mech_params)
-        self.cutting = MechanisticCuttingSubsystem(self.cut_params)
+        self.cutting = MechanisticCuttingSubsystem(self.cut_params, seed=seed)
         self.spindle_drive = PMSMSpindleDrive(seed=seed)
         self.pump_drive = PMSMPumpDrive()
 
@@ -241,9 +241,14 @@ class CentrifugalHydraulicMillingPlant(IPlant):
             axial_cutting_force_true=self.f_axial_true,
             spindle_cutting_torque_true=self.t_cutting_true,
             penetration_depth=self.cutting.penetration_depth,
+            surface_recession_depth=self.cutting.surface_recession_depth,
             contact_area=a_contact,
             material_removal_rate=self.mrr_true,
             cumulative_volume_removed=self.cutting.cumulative_volume_removed,
+            physical_rop=self.cutting.physical_rop_m_s,
+            demo_acceleration=self.cutting.params.demo_acceleration,
+            equivalent_process_time=self.cutting.equivalent_process_time,
+            disturbance_event=self.cutting.disturbance_event,
             spindle_speed_true=self.spindle_drive.mechanical_speed,
             pump_speed_true=self.pump_drive.mechanical_speed,
             chip_thickness=self.chip_h_true,
