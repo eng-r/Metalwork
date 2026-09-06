@@ -24,6 +24,7 @@ import {
 interface ChartPoint {
   t: number;
   pressure: number;
+  pressureRef: number;
   torque: number;
   torqueTrue: number;
   targetTorque: number;
@@ -44,6 +45,7 @@ export const App: React.FC = () => {
     controller_type: 'CascadeLADRC',
     pressure_bar: 1.01,
     pressure_true_bar: 1.01,
+    pressure_reference_bar: 1.01,
     spindle_rpm: 0.0,
     spindle_cmd_rpm: 3500.0,
     pump_rpm: 0.0,
@@ -57,6 +59,7 @@ export const App: React.FC = () => {
     axial_cutting_force_true: 0.0,
     rod_position_mm: 0.0,
     penetration_depth_mm: 0.0,
+    engagement_depth_mm: 0.0,
     mrr_mm3_s: 0.0,
     cumulative_volume_mm3: 0.0,
     seal_friction_n: 0.0,
@@ -77,6 +80,7 @@ export const App: React.FC = () => {
         const nextPt: ChartPoint = {
           t: data.timestamp,
           pressure: data.pressure_bar,
+          pressureRef: data.pressure_reference_bar,
           torque: data.spindle_torque_est,
           torqueTrue: data.spindle_torque_true,
           targetTorque: data.target_torque_nm,
@@ -213,8 +217,8 @@ export const App: React.FC = () => {
                   label="Pressure P"
                   value={barToPsi(telemetry.pressure_bar).toFixed(0)}
                   unit="psi"
-                  subValue={`True: ${barToPsi(
-                    telemetry.pressure_true_bar,
+                  subValue={`Ref: ${barToPsi(
+                    telemetry.pressure_reference_bar,
                   ).toFixed(0)} psi`}
                   highlight
                 />
@@ -254,15 +258,17 @@ export const App: React.FC = () => {
                   label="Physical ROP"
                   value={physicalRop.toFixed(3)}
                   unit="mm/min"
-                  subValue={`Eq. cut: ${(
+                  subValue={`Eng: ${telemetry.engagement_depth_mm.toFixed(
+                    3,
+                  )} mm • Eq.cut: ${(
                     telemetry.surface_recession_m * 1000.0
                   ).toFixed(2)} mm`}
                 />
                 <MetricCard
-                  label="LESO Total Dist."
+                  label="ESO Disturbance"
                   value={telemetry.leso_z3_disturbance.toFixed(2)}
-                  unit="f(t)"
-                  subValue="3rd-order LESO"
+                  unit="bar/s"
+                  subValue="2-state pressure ESO"
                 />
               </div>
 

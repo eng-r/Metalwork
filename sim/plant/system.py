@@ -190,9 +190,26 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         x_new = x0 + (dt / 6.0) * (dx1 + 2.0 * dx2 + 2.0 * dx3 + dx4)
         v_new = v0 + (dt / 6.0) * (dv1 + 2.0 * dv2 + 2.0 * dv3 + dv4)
 
-        # Apply state updates
-        self.hydraulics.pressure = max(self.hyd_params.atmospheric_pressure, p_new)
-        self.mechanics.position = max(0.0, min(self.mech_params.stroke_max, x_new))
+        # Apply state updates with consistent hard-stop velocity projection.
+        self.hydraulics.pressure = max(
+            self.hyd_params.atmospheric_pressure,
+            p_new,
+        )
+
+        if x_new <= 0.0 and v_new < 0.0:
+            x_new = 0.0
+            v_new = 0.0
+        elif (
+            x_new >= self.mech_params.stroke_max
+            and v_new > 0.0
+        ):
+            x_new = self.mech_params.stroke_max
+            v_new = 0.0
+
+        self.mechanics.position = max(
+            0.0,
+            min(self.mech_params.stroke_max, x_new),
+        )
         self.mechanics.velocity = v_new
         self.rod_accel_true = dv1
         self.f_friction_true = f_fric1
@@ -242,6 +259,7 @@ class CentrifugalHydraulicMillingPlant(IPlant):
             spindle_cutting_torque_true=self.t_cutting_true,
             penetration_depth=self.cutting.penetration_depth,
             surface_recession_depth=self.cutting.surface_recession_depth,
+            engagement_depth=self.cutting.engagement_depth,
             contact_area=a_contact,
             material_removal_rate=self.mrr_true,
             cumulative_volume_removed=self.cutting.cumulative_volume_removed,

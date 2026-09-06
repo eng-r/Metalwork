@@ -47,6 +47,17 @@ app.add_middleware(
 class SimulationRuntime:
     def __init__(self) -> None:
         self.plant = CentrifugalHydraulicMillingPlant()
+
+        # Preserve nominal calibration values. Configuration sliders scale these
+        # baselines; they must never replace them with a different hard-coded
+        # plant. The previous 1.2e-8 bypass constant was 20x the model default.
+        self.nominal_specific_energy = (
+            self.plant.cut_params.averaged_specific_energy
+        )
+        self.nominal_bypass_orifice_cd_a = (
+            self.plant.hyd_params.bypass_orifice_cd_a
+        )
+
         self.controller = CascadeLADRCController(target_torque_nm=4.0)
 
         # 4x previous backend history (3000 -> 12000 physics frames).
@@ -111,9 +122,10 @@ class SimulationRuntime:
         with self.lock:
             self.plant.cut_params.averaged_specific_energy = (
                 cfg.material_hardness_hrc / 42.0
-            ) * 3.2e9
+            ) * self.nominal_specific_energy
             self.plant.hyd_params.bypass_orifice_cd_a = (
-                1.2e-8 * cfg.bypass_orifice_area_scale
+                self.nominal_bypass_orifice_cd_a
+                * cfg.bypass_orifice_area_scale
             )
 
             wants_pid = cfg.controller_type.lower() == "pid"
@@ -185,7 +197,15 @@ def get_status() -> Dict[str, Any]:
         "pump_rpm": snap.sensors.pump_rpm,
         "spindle_torque_nm": snap.sensors.spindle_torque_est,
         "target_torque_nm": internal.get("target_torque_nm", 4.0),
+        "pressure_reference_bar": internal.get(
+            "filtered_reference_bar",
+            internal.get(
+                "torque_pressure_reference_bar",
+                snap.sensors.pressure_bar,
+            ),
+        ),
         "wob_n": snap.sensors.wob_soft_sensor,
+        "engagement_depth_m": snap.truth.engagement_depth,
         "physical_rop_m_s": snap.truth.physical_rop,
         "surface_recession_m": snap.truth.surface_recession_depth,
         "equivalent_process_time_s": snap.truth.equivalent_process_time,
@@ -269,6 +289,18 @@ async def websocket_telemetry(websocket: WebSocket) -> None:
                 "pressure_ceiling_bar": round(
                     float(internal.get("pressure_ceiling_bar", 35.0)), 3
                 ),
+                "pressure_reference_bar": round(
+                    float(
+                        internal.get(
+                            "filtered_reference_bar",
+                            internal.get(
+                                "torque_pressure_reference_bar",
+                                snap.sensors.pressure_bar,
+                            ),
+                        )
+                    ),
+                    3,
+                ),
                 "torque_pressure_reference_bar": round(
                     float(
                         internal.get(
@@ -287,6 +319,9 @@ async def websocket_telemetry(websocket: WebSocket) -> None:
                 ),
                 "penetration_depth_mm": round(
                     snap.truth.penetration_depth * 1000.0, 3
+                ),
+                "engagement_depth_mm": round(
+                    snap.truth.engagement_depth * 1000.0, 4
                 ),
                 "mrr_mm3_s": round(
                     snap.truth.material_removal_rate * 1.0e9, 6

@@ -36,6 +36,14 @@ class CuttingParameters:
     rubbing_torque_coeff: float = 13000.0    # calibrated edge/engagement torque term
     axial_damping: float = 800.0
 
+    # Unilateral contact compliance. Once the cylindrical face is fully
+    # engaged, additional virtual penetration represents elastic compression /
+    # impossible overlap, not more machinable volume. A penalty force prevents
+    # the rod from accumulating centimetres of uncut "engagement backlog".
+    contact_overtravel_stiffness: float = 8.0e6
+    contact_overtravel_damping: float = 1200.0
+    contact_full_face_margin: float = 5.0e-5
+
     # Level-B runout.
     runout_amplitude: float = 1.5e-5
 
@@ -168,6 +176,30 @@ class MechanisticCuttingSubsystem:
         gross_depth = max(0.0, rod_position - self.params.contact_start_pos)
         engagement = max(0.0, gross_depth - self.surface_recession_depth)
         return engagement, self._contact_area_from_depth(engagement)
+
+    def _full_face_engagement_depth(self) -> float:
+        r_s = self.params.target_sphere_radius
+        r_b = min(self.params.cutter_radius, r_s * 0.999999)
+        return r_s - math.sqrt(max(0.0, r_s * r_s - r_b * r_b))
+
+    def _contact_overtravel_force(
+        self,
+        engagement_depth: float,
+        rod_velocity: float,
+    ) -> float:
+        onset = (
+            self._full_face_engagement_depth()
+            + self.params.contact_full_face_margin
+        )
+        excess = max(0.0, engagement_depth - onset)
+        if excess <= 0.0:
+            return 0.0
+
+        return (
+            self.params.contact_overtravel_stiffness * excess
+            + self.params.contact_overtravel_damping
+            * max(0.0, rod_velocity)
+        )
 
     def _material_hardness(self, cut_front_depth: float) -> float:
         depth_mm = cut_front_depth * 1000.0
@@ -382,12 +414,35 @@ class MechanisticCuttingSubsystem:
         chip_multiplier, jam_started, release_started = self._update_chip_transport(
             dt, mrr, spindle_speed, engagement, self.hardness_multiplier
         )
+        # Material removal changed the cutting surface during this same step.
+        # Return the POST-removal engagement, otherwise force/torque can remain
+        # artificially saturated one step (or much longer if a large backlog
+        # was allowed to accumulate).
+        self.engagement_depth = max(
+            0.0,
+            gross_depth - self.surface_recession_depth,
+        )
+        area_after = self._contact_area_from_depth(
+            self.engagement_depth
+        )
+
         omega = max(1.0, abs(spindle_speed))
         n_rev = omega / (2.0 * math.pi)
         surface_rate = mrr / max(area, 1.0e-12)
-        h_avg = surface_rate / max(1.0e-9, self.params.flute_count * n_rev)
-        self.engagement_depth = max(0.0, gross_depth - self.surface_recession_depth)
-        return engagement, area, mrr, h_avg, chip_multiplier, jam_started, release_started
+        h_avg = surface_rate / max(
+            1.0e-9,
+            self.params.flute_count * n_rev,
+        )
+
+        return (
+            self.engagement_depth,
+            area_after,
+            mrr,
+            h_avg,
+            chip_multiplier,
+            jam_started,
+            release_started,
+        )
 
     def step_level_a_averaged(
         self,
@@ -412,6 +467,10 @@ class MechanisticCuttingSubsystem:
             * (1.0 + 0.30 * max(0.0, chip_mult - 1.0))
             * area
             + self.params.axial_damping * max(0.0, rod_velocity)
+            + self._contact_overtravel_force(
+                engagement,
+                rod_velocity,
+            )
         )
         t_vib, f_vib = self._update_vibration(
             dt, spindle_speed, torque_nominal, force_nominal, hard, chip_mult, jam_started, release_started
@@ -457,8 +516,21 @@ class MechanisticCuttingSubsystem:
                     df_a = (self.params.k_ac * hard * h_inst + self.params.k_ae) * dz
                     total_torque += df_t * r_eff
                     total_axial_force += df_a
-        total_axial_force += self.params.axial_thrust_coeff * hard * area * 0.35
-        total_torque += self.params.rubbing_torque_coeff * area * 0.35
+        total_axial_force += (
+            self.params.axial_thrust_coeff
+            * hard
+            * area
+            * 0.35
+        )
+        total_axial_force += self._contact_overtravel_force(
+            engagement,
+            rod_velocity,
+        )
+        total_torque += (
+            self.params.rubbing_torque_coeff
+            * area
+            * 0.35
+        )
         t_vib, f_vib = self._update_vibration(
             dt, spindle_speed, max(0.15, total_torque), max(20.0, total_axial_force),
             hard, chip_mult, jam_started, release_started

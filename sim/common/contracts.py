@@ -70,6 +70,7 @@ class TruthDiagnostics:
     # Geometry / removal truth.
     penetration_depth: float = 0.0          # geometric tool intrusion from first contact [m]
     surface_recession_depth: float = 0.0    # actual removed/crater advance [m]
+    engagement_depth: float = 0.0             # instantaneous unremoved interference [m]
     contact_area: float = 0.0
     material_removal_rate: float = 0.0      # physical MRR [m^3/s]
     cumulative_volume_removed: float = 0.0

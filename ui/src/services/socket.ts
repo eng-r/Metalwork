@@ -10,6 +10,7 @@ export interface TelemetryData {
 
   pressure_bar: number;
   pressure_true_bar: number;
+  pressure_reference_bar: number;
   spindle_rpm: number;
   spindle_cmd_rpm: number;
   pump_rpm: number;
@@ -24,6 +25,7 @@ export interface TelemetryData {
 
   rod_position_mm: number;
   penetration_depth_mm: number;
+  engagement_depth_mm: number;
   mrr_mm3_s: number;
   cumulative_volume_mm3: number;
   seal_friction_n: number;

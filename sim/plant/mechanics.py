@@ -1,5 +1,9 @@
 """
-Pusher Mechanics Model: Rod Kinematics, Mass Balance, and Pressure-Dependent Seal Friction.
+Pusher mechanics with pressure-dependent seal friction and true stiction.
+
+The previous regularized tanh law produced exactly zero seal friction at zero
+velocity. That is not static friction and can create artificial rod/pressure
+limit cycles. This implementation explicitly balances sub-breakaway force.
 """
 
 from dataclasses import dataclass
@@ -9,69 +13,120 @@ from typing import Tuple
 
 @dataclass
 class MechanicsParameters:
-    """Mechanical and friction parameters for the pusher assembly."""
-    effective_mass: float = 45.0                # Total moving mass M_eff (kg)
-    viscous_damping: float = 120.0              # Rod structural viscous damping C_visc (N*s/m)
-    stroke_max: float = 0.25                    # Maximum rod travel stroke (m)
-    endstop_stiffness: float = 5.0e7            # Hard stop stiffness K_stop (N/m)
-    endstop_damping: float = 1.0e5              # Hard stop damping C_stop (N*s/m)
-    # Pressure-dependent Stribeck friction parameters:
-    coulomb_friction_base: float = 220.0        # F_c0 base Coulomb friction at 0 bar gauge (N)
-    coulomb_pressure_alpha: float = 1.2e-4      # alpha_cp: Coulomb increase per Pa (~12 N / bar)
-    static_friction_base: float = 480.0         # F_s0 base breakaway friction at 0 bar gauge (N)
-    static_pressure_alpha: float = 2.4e-4       # alpha_sp: Breakaway increase per Pa (~24 N / bar)
-    stribeck_velocity: float = 0.008            # v_s characteristic Stribeck velocity (m/s)
-    stribeck_exponent: float = 1.5              # delta shape factor
-    viscous_seal_base: float = 350.0            # sigma_v0 seal viscous friction (N*s/m)
-    viscous_seal_alpha: float = 8.0e-5          # alpha_vp viscous increase per Pa
-    velocity_transition_tol: float = 1.0e-4     # v_trans for continuous tanh regularization (m/s)
+    effective_mass: float = 45.0
+    viscous_damping: float = 120.0
+    stroke_max: float = 0.25
+    endstop_stiffness: float = 5.0e7
+    endstop_damping: float = 1.0e5
+
+    coulomb_friction_base: float = 220.0
+    coulomb_pressure_alpha: float = 1.2e-4
+    static_friction_base: float = 480.0
+    static_pressure_alpha: float = 2.4e-4
+    stribeck_velocity: float = 0.008
+    stribeck_exponent: float = 1.5
+    viscous_seal_base: float = 350.0
+    viscous_seal_alpha: float = 8.0e-5
+
+    # Velocity below which a static-force balance is allowed.
+    velocity_transition_tol: float = 1.0e-4
 
 
 class MechanicsSubsystem:
-    """
-    Computes axial acceleration, velocity, displacement, and pressure-dependent seal friction.
-    """
-
-    def __init__(self, params: MechanicsParameters = MechanicsParameters()) -> None:
+    def __init__(
+        self,
+        params: MechanicsParameters = MechanicsParameters(),
+    ) -> None:
         self.params = params
         self.position = 0.0
         self.velocity = 0.0
 
-    def reset(self, initial_position: float = 0.0, initial_velocity: float = 0.0) -> None:
-        """Reset kinematic state variables."""
+    def reset(
+        self,
+        initial_position: float = 0.0,
+        initial_velocity: float = 0.0,
+    ) -> None:
         self.position = initial_position
         self.velocity = initial_velocity
 
-    def compute_seal_friction(self, gauge_pressure: float, velocity: float) -> float:
-        """
-        Compute nonlinear pressure-dependent Stribeck friction.
-        """
+    def _friction_levels(
+        self,
+        gauge_pressure: float,
+    ) -> Tuple[float, float, float]:
         p_eff = max(0.0, gauge_pressure)
+        f_c = (
+            self.params.coulomb_friction_base
+            + self.params.coulomb_pressure_alpha * p_eff
+        )
+        f_s = (
+            self.params.static_friction_base
+            + self.params.static_pressure_alpha * p_eff
+        )
+        sigma_v = (
+            self.params.viscous_seal_base
+            + self.params.viscous_seal_alpha * p_eff
+        )
+        return f_c, f_s, sigma_v
 
-        f_c = self.params.coulomb_friction_base + self.params.coulomb_pressure_alpha * p_eff
-        f_s = self.params.static_friction_base + self.params.static_pressure_alpha * p_eff
-        sigma_v = self.params.viscous_seal_base + self.params.viscous_seal_alpha * p_eff
+    def compute_seal_friction(
+        self,
+        gauge_pressure: float,
+        velocity: float,
+        impending_force: float = 0.0,
+    ) -> float:
+        """
+        Signed friction force in the direction opposing motion/incipient motion.
+        """
+        f_c, f_s, sigma_v = self._friction_levels(
+            gauge_pressure,
+        )
+        tol = self.params.velocity_transition_tol
 
-        # Stribeck decay term
+        if abs(velocity) < tol:
+            if abs(impending_force) <= f_s:
+                # Exact stiction balance.
+                return impending_force
+            direction = 1.0 if impending_force >= 0.0 else -1.0
+            return direction * f_s
+
         abs_v = abs(velocity)
-        stribeck_factor = math.exp(-((abs_v / max(1.0e-6, self.params.stribeck_velocity)) ** self.params.stribeck_exponent))
-        dry_friction = f_c + (f_s - f_c) * stribeck_factor
+        stribeck_factor = math.exp(
+            -(
+                abs_v
+                / max(
+                    1.0e-6,
+                    self.params.stribeck_velocity,
+                )
+            )
+            ** self.params.stribeck_exponent
+        )
+        dry_magnitude = (
+            f_c
+            + (f_s - f_c) * stribeck_factor
+        )
+        total_magnitude = dry_magnitude + sigma_v * abs_v
+        return math.copysign(total_magnitude, velocity)
 
-        # Regularized directional scaling via tanh
-        directional_term = math.tanh(velocity / self.params.velocity_transition_tol)
-
-        return dry_friction * directional_term + sigma_v * velocity
-
-    def compute_endstop_force(self, position: float, velocity: float) -> float:
-        """Compute structural restoring force when contacting travel limits."""
-        f_stop = 0.0
+    def compute_endstop_force(
+        self,
+        position: float,
+        velocity: float,
+    ) -> float:
         if position < 0.0:
             penetration = -position
-            f_stop = self.params.endstop_stiffness * penetration - self.params.endstop_damping * velocity
-        elif position > self.params.stroke_max:
+            return (
+                self.params.endstop_stiffness * penetration
+                - self.params.endstop_damping * velocity
+            )
+
+        if position > self.params.stroke_max:
             penetration = position - self.params.stroke_max
-            f_stop = -(self.params.endstop_stiffness * penetration + self.params.endstop_damping * velocity)
-        return f_stop
+            return -(
+                self.params.endstop_stiffness * penetration
+                + self.params.endstop_damping * velocity
+            )
+
+        return 0.0
 
     def compute_acceleration(
         self,
@@ -81,17 +136,37 @@ class MechanicsSubsystem:
         position: float,
         velocity: float,
     ) -> Tuple[float, float]:
-        """
-        Compute rod net acceleration and seal friction force.
-        Returns: (acceleration, seal_friction_force)
-        """
         f_hyd = gauge_pressure * piston_area
-        f_fric = self.compute_seal_friction(gauge_pressure, velocity)
-        f_visc = self.params.viscous_damping * velocity
-        f_stop = self.compute_endstop_force(position, velocity)
+        f_structural = self.params.viscous_damping * velocity
+        f_stop = self.compute_endstop_force(
+            position,
+            velocity,
+        )
 
-        # Net axial force
-        f_net = f_hyd - f_fric - f_visc - axial_cutting_force + f_stop
+        # Force that the seal friction must oppose.
+        impending = (
+            f_hyd
+            - f_structural
+            - axial_cutting_force
+            + f_stop
+        )
 
+        f_friction = self.compute_seal_friction(
+            gauge_pressure,
+            velocity,
+            impending_force=impending,
+        )
+
+        _, f_static_limit, _ = self._friction_levels(
+            gauge_pressure,
+        )
+        if (
+            abs(velocity) < self.params.velocity_transition_tol
+            and abs(impending) <= f_static_limit
+        ):
+            # Stuck seal: friction exactly balances the remaining load.
+            return 0.0, f_friction
+
+        f_net = impending - f_friction
         acceleration = f_net / self.params.effective_mass
-        return acceleration, f_fric
+        return acceleration, f_friction
