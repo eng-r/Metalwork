@@ -28,11 +28,14 @@ interface ChartPoint {
   torque: number;
   torqueTrue: number;
   targetTorque: number;
+  achievableTorque: number;
+  limited: boolean;
   wob: number;
   spindleRpm: number;
   spindleCmdRpm: number;
   pumpRpm: number;
   pumpCmdRpm: number;
+  pumpFeedforwardRpm: number;
   ropMps: number;
 }
 
@@ -43,20 +46,30 @@ export const App: React.FC = () => {
     is_running: false,
     operating_mode: 'APPROACH',
     controller_type: 'CascadeLADRC',
+
     pressure_bar: 1.01,
     pressure_true_bar: 1.01,
     pressure_reference_bar: 1.01,
+    pressure_feedforward_bar: 1.01,
+    pressure_ceiling_bar: 35.0,
+
     spindle_rpm: 0.0,
     spindle_cmd_rpm: 3500.0,
     pump_rpm: 0.0,
     pump_cmd_rpm: 0.0,
+    pump_feedforward_rpm: 0.0,
+
     spindle_torque_est: 0.0,
     spindle_torque_true: 0.0,
     target_torque_nm: 4.0,
-    pressure_ceiling_bar: 35.0,
-    torque_pressure_reference_bar: 18.0,
+    achievable_torque_nm: 6.4,
+    control_limited: false,
+    limit_reason: '',
+
     wob_soft_sensor: 0.0,
     axial_cutting_force_true: 0.0,
+    target_wob_n: 0.0,
+
     rod_position_mm: 0.0,
     penetration_depth_mm: 0.0,
     engagement_depth_mm: 0.0,
@@ -64,6 +77,7 @@ export const App: React.FC = () => {
     cumulative_volume_mm3: 0.0,
     seal_friction_n: 0.0,
     leso_z3_disturbance: 0.0,
+
     physical_rop_m_s: 0.0,
     surface_recession_m: 0.0,
     demo_acceleration: 120.0,
@@ -84,22 +98,22 @@ export const App: React.FC = () => {
           torque: data.spindle_torque_est,
           torqueTrue: data.spindle_torque_true,
           targetTorque: data.target_torque_nm,
+          achievableTorque: data.achievable_torque_nm,
+          limited: data.control_limited,
           wob: data.wob_soft_sensor,
           spindleRpm: data.spindle_rpm,
           spindleCmdRpm: data.spindle_cmd_rpm,
           pumpRpm: data.pump_rpm,
           pumpCmdRpm: data.pump_cmd_rpm,
+          pumpFeedforwardRpm: data.pump_feedforward_rpm,
           ropMps: data.physical_rop_m_s,
         };
         const updated = [...prev, nextPt];
-
-        // 4x previous browser chart memory (250 -> 1000 samples).
         return updated.length > 1000
           ? updated.slice(updated.length - 1000)
           : updated;
       });
     });
-
     return () => unsubscribe();
   }, []);
 
@@ -212,6 +226,19 @@ export const App: React.FC = () => {
         <div className="p-8 space-y-6 flex-1">
           {activeTab === 'monitor' && (
             <>
+              {telemetry.control_limited && (
+                <div className="rounded border border-rose-300 bg-rose-50 px-4 py-3 text-[11px] font-mono text-rose-900 flex flex-wrap gap-x-5 gap-y-1">
+                  <span className="font-bold">SETPOINT LIMITED</span>
+                  <span>{telemetry.limit_reason}</span>
+                  <span>
+                    nominal max ≈ {nmToFtLbf(telemetry.achievable_torque_nm).toFixed(2)} ft·lbf
+                  </span>
+                  <span>
+                    pressure ceiling = {barToPsi(telemetry.pressure_ceiling_bar).toFixed(0)} psi
+                  </span>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-4">
                 <MetricCard
                   label="Pressure P"
@@ -226,7 +253,9 @@ export const App: React.FC = () => {
                   label="Weight On Bit"
                   value={newtonToLbf(telemetry.wob_soft_sensor).toFixed(0)}
                   unit="lbf"
-                  subValue={`True: ${newtonToLbf(
+                  subValue={`SP≈${newtonToLbf(telemetry.target_wob_n).toFixed(
+                    0,
+                  )} • True ${newtonToLbf(
                     telemetry.axial_cutting_force_true,
                   ).toFixed(0)} lbf`}
                 />
@@ -237,10 +266,7 @@ export const App: React.FC = () => {
                   subValue={`SP: ${nmToFtLbf(
                     telemetry.target_torque_nm,
                   ).toFixed(2)} ft·lbf`}
-                  highlight={
-                    telemetry.spindle_torque_est >
-                    telemetry.target_torque_nm * 1.35
-                  }
+                  highlight={telemetry.control_limited}
                 />
                 <MetricCard
                   label="Spindle Speed"
@@ -252,7 +278,9 @@ export const App: React.FC = () => {
                   label="Pump Speed"
                   value={telemetry.pump_rpm.toFixed(0)}
                   unit="RPM"
-                  subValue={`Cmd: ${telemetry.pump_cmd_rpm.toFixed(0)}`}
+                  subValue={`FF ${telemetry.pump_feedforward_rpm.toFixed(
+                    0,
+                  )} • Cmd ${telemetry.pump_cmd_rpm.toFixed(0)}`}
                 />
                 <MetricCard
                   label="Physical ROP"
@@ -268,19 +296,21 @@ export const App: React.FC = () => {
                   label="ESO Disturbance"
                   value={telemetry.leso_z3_disturbance.toFixed(2)}
                   unit="bar/s"
-                  subValue="2-state pressure ESO"
+                  subValue="pressure-rate lumped disturbance"
                 />
               </div>
 
               <div className="rounded border border-violet-200 bg-violet-50/60 px-4 py-3 text-[11px] font-mono text-violet-900 flex flex-wrap gap-x-6 gap-y-1">
                 <span className="font-bold">ACCELERATED PROCESS DEMO</span>
                 <span>
-                  ROP shown is the physical rate. Only slow material/crater evolution
-                  is time-compressed {telemetry.demo_acceleration.toFixed(0)}× so
-                  hours of Inconel milling are observable in minutes.
+                  ROP shown is physical. Only slow material/crater evolution is
+                  time-compressed {telemetry.demo_acceleration.toFixed(0)}×.
                 </span>
                 <span>
                   Nominal 0.08 mm/min ⇒ 3–4 in requires roughly 16–21 h actual cutting.
+                </span>
+                <span>
+                  UI actual waveforms are anti-aliased over 33 ms; SP/ref traces remain sharp.
                 </span>
               </div>
 
@@ -308,6 +338,8 @@ export const App: React.FC = () => {
                 currentTargetTorqueNm={telemetry.target_torque_nm}
                 currentPressureCeilingBar={telemetry.pressure_ceiling_bar}
                 currentSpindleRpm={telemetry.spindle_cmd_rpm}
+                currentAchievableTorqueNm={telemetry.achievable_torque_nm}
+                controlLimited={telemetry.control_limited}
               />
             </div>
           )}
@@ -319,7 +351,8 @@ export const App: React.FC = () => {
                   SYSTEM IDENTIFICATION & DOE CALIBRATION STATUS
                 </h2>
                 <p className="text-xs text-slate-500 font-mono mt-0.5">
-                  Identified Grey-Box Parameter Bounds vs Ground Truth for Inconel 718.
+                  Calibrate pump map, hydraulic compliance, seal friction, WOB↔ToB gain,
+                  and WOB/RPM/hardness→ROP before controller comparison.
                 </p>
               </div>
 
@@ -329,39 +362,28 @@ export const App: React.FC = () => {
                     <tr>
                       <th className="p-3 text-left">PARAMETER</th>
                       <th className="p-3 text-left">SUBSYSTEM</th>
-                      <th className="p-3 text-right">CALIBRATED VALUE</th>
-                      <th className="p-3 text-right">PRIOR / NOMINAL</th>
-                      <th className="p-3 text-right">RESIDUAL STATUS</th>
+                      <th className="p-3 text-right">NOMINAL</th>
+                      <th className="p-3 text-right">ROLE</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
                     <tr>
-                      <td className="p-3 font-semibold">
-                        k_c (Specific Cutting Energy)
-                      </td>
-                      <td className="p-3 text-slate-500">
-                        Inconel 718 Mechanics
-                      </td>
-                      <td className="p-3 text-right font-bold text-primary">
-                        3180.4 MPa
-                      </td>
-                      <td className="p-3 text-right">3200.0 MPa</td>
-                      <td className="p-3 text-right text-emerald-600 font-bold">
-                        Passed (0.6%)
-                      </td>
+                      <td className="p-3 font-semibold">c_TF = μ_eff·r_eff</td>
+                      <td className="p-3 text-slate-500">Cutting load</td>
+                      <td className="p-3 text-right font-bold text-primary">1.05 mm</td>
+                      <td className="p-3 text-right">WOB → ToB</td>
                     </tr>
                     <tr>
-                      <td className="p-3 font-semibold">
-                        k_ax (Axial Thrust Coeff)
-                      </td>
-                      <td className="p-3 text-slate-500">Contact Thrust</td>
-                      <td className="p-3 text-right font-bold text-primary">
-                        18.00 MPa
-                      </td>
-                      <td className="p-3 text-right">18.00 MPa</td>
-                      <td className="p-3 text-right text-emerald-600 font-bold">
-                        Passed (0.0%)
-                      </td>
+                      <td className="p-3 font-semibold">k_contact</td>
+                      <td className="p-3 text-slate-500">Contact mechanics</td>
+                      <td className="p-3 text-right font-bold text-primary">5.5 MN/m</td>
+                      <td className="p-3 text-right">engagement → WOB</td>
+                    </tr>
+                    <tr>
+                      <td className="p-3 font-semibold">ROP_ref</td>
+                      <td className="p-3 text-slate-500">Inconel removal</td>
+                      <td className="p-3 text-right font-bold text-primary">0.08 mm/min</td>
+                      <td className="p-3 text-right">WOB/RPM/H → ROP</td>
                     </tr>
                   </tbody>
                 </table>
@@ -376,8 +398,8 @@ export const App: React.FC = () => {
                   SCIENTIFIC & PRESENTATION EXPORT CENTER
                 </h2>
                 <p className="text-xs text-slate-500 font-mono mt-0.5">
-                  Backend exports remain in engineering/SI units; US-customary
-                  conversions are UI-only.
+                  Backend exports remain SI / engineering units; US-customary conversions
+                  are UI-only.
                 </p>
               </div>
 
@@ -392,14 +414,12 @@ export const App: React.FC = () => {
                     Download Telemetry CSV
                   </div>
                   <p className="text-xs text-slate-500 font-mono mt-2">
-                    Pressure, ToB, WOB, physical ROP and disturbance event history.
+                    Pressure, pump command, ToB, WOB, physical ROP, engagement and events.
                   </p>
                 </a>
 
                 <div className="p-5 border border-border rounded bg-slate-50/50 flex flex-col justify-between">
-                  <div className="text-slate-900 font-bold text-sm">
-                    Display convention
-                  </div>
+                  <div className="text-slate-900 font-bold text-sm">Display convention</div>
                   <p className="text-xs text-slate-500 font-mono mt-2">
                     UI: psi, lbf, ft·lbf, mm/min
                     <br />

@@ -1,5 +1,10 @@
 """
-Integrated Physical Plant: CentrifugalHydraulicMillingPlant implementing IPlant with RK4 ODE integration.
+Integrated physical plant for the centrifugal-hydraulic milling simulator.
+
+Numerical integration uses RK4 for pressure/rod states. Crucially, the cutting/contact
+reaction is re-evaluated at every RK stage using the stage-specific rod state while slow
+material/chip states are frozen across that 1 ms integration interval. That keeps the
+stiff contact coupling consistent instead of holding one axial force across all RK stages.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -15,22 +20,12 @@ from sim.plant.motors import PMSMPumpDrive, PMSMSpindleDrive
 
 
 class CentrifugalHydraulicMillingPlant(IPlant):
-    """
-    High-fidelity physical truth plant combining:
-    - Variable-speed centrifugal pump H-Q curves
-    - Hydraulic chamber fluid continuity with entrained air bulk modulus
-    - Stiff calibrated bypass orifice and seal leakage
-    - Pressure-dependent Stribeck cylinder seal friction
-    - Inconel 718 mechanistic milling against spherical workpiece
-    - PMSM drives with FOC Iq current loops and resolver tracking
-    """
-
     def __init__(
         self,
         hyd_params: Optional[HydraulicParameters] = None,
         mech_params: Optional[MechanicsParameters] = None,
         cut_params: Optional[CuttingParameters] = None,
-        fidelity_level: str = "averaged",        # "averaged" (Level A) or "tooth_resolved" (Level B)
+        fidelity_level: str = "averaged",
         seed: int = 42,
     ) -> None:
         self.hyd_params = hyd_params or HydraulicParameters()
@@ -40,14 +35,12 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         self.seed = seed
         self.rng = random.Random(seed)
 
-        # Subsystems
         self.hydraulics = HydraulicSubsystem(self.hyd_params)
         self.mechanics = MechanicsSubsystem(self.mech_params)
         self.cutting = MechanisticCuttingSubsystem(self.cut_params, seed=seed)
         self.spindle_drive = PMSMSpindleDrive(seed=seed)
         self.pump_drive = PMSMPumpDrive()
 
-        # Cached state
         self.sim_time = 0.0
         self.f_axial_true = 0.0
         self.t_cutting_true = 0.0
@@ -58,6 +51,7 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         self.q_bypass_true = 0.0
         self.q_leak_true = 0.0
         self.rod_accel_true = 0.0
+
         self.pressure_sensor_val = self.hyd_params.atmospheric_pressure
         self.displacement_sensor_val = 0.0
         self.spindle_speed_res = 0.0
@@ -65,13 +59,17 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         self.spindle_torque_est = 0.0
 
     def reset(self, initial_state: Optional[Dict[str, Any]] = None) -> None:
-        """Reset all plant states to initial conditions."""
-        init_p = initial_state.get("pressure", self.hyd_params.atmospheric_pressure) if initial_state else self.hyd_params.atmospheric_pressure
+        init_p = (
+            initial_state.get("pressure", self.hyd_params.atmospheric_pressure)
+            if initial_state
+            else self.hyd_params.atmospheric_pressure
+        )
         init_x = initial_state.get("position", 0.0) if initial_state else 0.0
+        init_v = initial_state.get("velocity", 0.0) if initial_state else 0.0
 
         self.rng = random.Random(self.seed)
         self.hydraulics.reset(initial_pressure=init_p)
-        self.mechanics.reset(initial_position=init_x, initial_velocity=0.0)
+        self.mechanics.reset(initial_position=init_x, initial_velocity=init_v)
         self.cutting.reset()
         self.spindle_drive.reset()
         self.pump_drive.reset()
@@ -86,6 +84,7 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         self.q_bypass_true = 0.0
         self.q_leak_true = 0.0
         self.rod_accel_true = 0.0
+
         self.pressure_sensor_val = init_p
         self.displacement_sensor_val = init_x
         self.spindle_speed_res = 0.0
@@ -97,17 +96,23 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         p_curr: float,
         x_curr: float,
         v_curr: float,
-        omega_p: float,
-        f_axial: float,
+        omega_pump: float,
+        omega_spindle: float,
     ) -> Tuple[float, float, float, float, float, float, float]:
-        """
-        Compute state derivatives: [dp_dt, dx_dt, dv_dt] and instantaneous forces/flows.
-        """
-        dp_dt, q_pump, q_bypass, q_leak = self.hydraulics.compute_pressure_derivative(
-            pressure=p_curr,
+        """Evaluate the coupled hydraulic/contact mechanics at one RK stage."""
+        f_axial = self.cutting.evaluate_axial_force(
             rod_position=x_curr,
             rod_velocity=v_curr,
-            omega_pump=omega_p,
+            spindle_speed=omega_spindle,
+        )
+
+        dp_dt, q_pump, q_bypass, q_leak = (
+            self.hydraulics.compute_pressure_derivative(
+                pressure=p_curr,
+                rod_position=x_curr,
+                rod_velocity=v_curr,
+                omega_pump=omega_pump,
+            )
         )
 
         gauge_p = p_curr - self.hyd_params.atmospheric_pressure
@@ -118,79 +123,63 @@ class CentrifugalHydraulicMillingPlant(IPlant):
             position=x_curr,
             velocity=v_curr,
         )
-
         return dp_dt, v_curr, accel, f_fric, q_pump, q_bypass, q_leak
 
     def step(self, dt: float, commands: ControlCommands) -> None:
-        """
-        Step physical states by dt using 4th-Order Runge-Kutta (RK4) integration.
-        """
-        # 1. Step PMSM motor drives
+        # 1. Actuator dynamics. The spindle sees the previous 1 ms cutting torque; this is a
+        # physically negligible transport delay and avoids algebraic motor/cutting coupling.
         pump_w_cmd = commands.pump_speed_cmd_rads if commands.enable_pump else 0.0
-        spindle_w_cmd = commands.spindle_speed_cmd_rads if commands.enable_spindle else 0.0
-
-        self.pump_speed_res = self.pump_drive.step(dt, pump_w_cmd)
-        spindle_w_true, self.spindle_speed_res, self.spindle_torque_est = self.spindle_drive.step(
-            dt, spindle_w_cmd, self.t_cutting_true
+        spindle_w_cmd = (
+            commands.spindle_speed_cmd_rads if commands.enable_spindle else 0.0
         )
 
+        self.pump_speed_res = self.pump_drive.step(dt, pump_w_cmd)
+        (
+            spindle_w_true,
+            self.spindle_speed_res,
+            self.spindle_torque_est,
+        ) = self.spindle_drive.step(
+            dt,
+            spindle_w_cmd,
+            self.t_cutting_true,
+        )
         omega_pump_mech = self.pump_drive.mechanical_speed
 
-        # 2. Compute current cutting reaction forces
-        if self.fidelity_level == "tooth_resolved":
-            f_ax, t_cut, mrr, h_chip = self.cutting.step_level_b_tooth_resolved(
-                dt, self.mechanics.position, self.mechanics.velocity, spindle_w_true
-            )
-        else:
-            f_ax, t_cut, mrr, h_chip = self.cutting.step_level_a_averaged(
-                dt, self.mechanics.position, self.mechanics.velocity, spindle_w_true
-            )
-
-        self.f_axial_true = f_ax
-        self.t_cutting_true = t_cut
-        self.mrr_true = mrr
-        self.chip_h_true = h_chip
-
-        # 3. Continuous RK4 ODE integration for [Pressure, Position, Velocity]
+        # 2. RK4 for hydraulic pressure + pusher position/velocity. Contact force is evaluated
+        # at each RK stage using the current stage geometry.
         p0 = self.hydraulics.pressure
         x0 = self.mechanics.position
         v0 = self.mechanics.velocity
 
-        # k1
         dp1, dx1, dv1, f_fric1, q_p1, q_b1, q_l1 = self._state_derivatives(
-            p0, x0, v0, omega_pump_mech, self.f_axial_true
+            p0, x0, v0, omega_pump_mech, spindle_w_true
         )
 
-        # k2
-        p_k2 = p0 + 0.5 * dt * dp1
-        x_k2 = x0 + 0.5 * dt * dx1
-        v_k2 = v0 + 0.5 * dt * dv1
+        p2 = p0 + 0.5 * dt * dp1
+        x2 = x0 + 0.5 * dt * dx1
+        v2 = v0 + 0.5 * dt * dv1
         dp2, dx2, dv2, _, _, _, _ = self._state_derivatives(
-            p_k2, x_k2, v_k2, omega_pump_mech, self.f_axial_true
+            p2, x2, v2, omega_pump_mech, spindle_w_true
         )
 
-        # k3
-        p_k3 = p0 + 0.5 * dt * dp2
-        x_k3 = x0 + 0.5 * dt * dx2
-        v_k3 = v0 + 0.5 * dt * dv2
+        p3 = p0 + 0.5 * dt * dp2
+        x3 = x0 + 0.5 * dt * dx2
+        v3 = v0 + 0.5 * dt * dv2
         dp3, dx3, dv3, _, _, _, _ = self._state_derivatives(
-            p_k3, x_k3, v_k3, omega_pump_mech, self.f_axial_true
+            p3, x3, v3, omega_pump_mech, spindle_w_true
         )
 
-        # k4
-        p_k4 = p0 + dt * dp3
-        x_k4 = x0 + dt * dx3
-        v_k4 = v0 + dt * dv3
+        p4 = p0 + dt * dp3
+        x4 = x0 + dt * dx3
+        v4 = v0 + dt * dv3
         dp4, dx4, dv4, _, _, _, _ = self._state_derivatives(
-            p_k4, x_k4, v_k4, omega_pump_mech, self.f_axial_true
+            p4, x4, v4, omega_pump_mech, spindle_w_true
         )
 
-        # Weighted RK4 update
-        p_new = p0 + (dt / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
-        x_new = x0 + (dt / 6.0) * (dx1 + 2.0 * dx2 + 2.0 * dx3 + dx4)
-        v_new = v0 + (dt / 6.0) * (dv1 + 2.0 * dv2 + 2.0 * dv3 + dv4)
+        p_new = p0 + dt / 6.0 * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
+        x_new = x0 + dt / 6.0 * (dx1 + 2.0 * dx2 + 2.0 * dx3 + dx4)
+        v_new = v0 + dt / 6.0 * (dv1 + 2.0 * dv2 + 2.0 * dv3 + dv4)
 
-        # Apply state updates with consistent hard-stop velocity projection.
         self.hydraulics.pressure = max(
             self.hyd_params.atmospheric_pressure,
             p_new,
@@ -199,10 +188,7 @@ class CentrifugalHydraulicMillingPlant(IPlant):
         if x_new <= 0.0 and v_new < 0.0:
             x_new = 0.0
             v_new = 0.0
-        elif (
-            x_new >= self.mech_params.stroke_max
-            and v_new > 0.0
-        ):
+        elif x_new >= self.mech_params.stroke_max and v_new > 0.0:
             x_new = self.mech_params.stroke_max
             v_new = 0.0
 
@@ -211,25 +197,47 @@ class CentrifugalHydraulicMillingPlant(IPlant):
             min(self.mech_params.stroke_max, x_new),
         )
         self.mechanics.velocity = v_new
+
         self.rod_accel_true = dv1
         self.f_friction_true = f_fric1
         self.q_pump_true = q_p1
         self.q_bypass_true = q_b1
         self.q_leak_true = q_l1
 
+        # 3. Advance the slow cutting/material states once after the mechanical state update.
+        if self.fidelity_level == "tooth_resolved":
+            f_ax, t_cut, mrr, h_chip = self.cutting.step_level_b_tooth_resolved(
+                dt,
+                self.mechanics.position,
+                self.mechanics.velocity,
+                spindle_w_true,
+            )
+        else:
+            f_ax, t_cut, mrr, h_chip = self.cutting.step_level_a_averaged(
+                dt,
+                self.mechanics.position,
+                self.mechanics.velocity,
+                spindle_w_true,
+            )
+
+        self.f_axial_true = f_ax
+        self.t_cutting_true = t_cut
+        self.mrr_true = mrr
+        self.chip_h_true = h_chip
         self.sim_time += dt
 
-        # 4. Sensor emulation with small measurement noise
-        # Hydraulic line pressure sensor (+- 0.15 bar noise)
-        p_noise = self.rng.gauss(0.0, 1.5e4)
-        self.pressure_sensor_val = max(self.hyd_params.atmospheric_pressure, self.hydraulics.pressure + p_noise)
+        # 4. Sensor emulation. Noise is small compared with process excursions; high-frequency
+        # truth is anti-aliased before the 30 Hz UI stream in sim/server.py.
+        p_noise = self.rng.gauss(0.0, 5.0e3)  # 0.05 bar sigma
+        self.pressure_sensor_val = max(
+            self.hyd_params.atmospheric_pressure,
+            self.hydraulics.pressure + p_noise,
+        )
 
-        # Linear displacement transducer (+- 5 microns noise)
         x_noise = self.rng.gauss(0.0, 5.0e-6)
         self.displacement_sensor_val = self.mechanics.position + x_noise
 
     def get_sensor_readings(self) -> ProcessVariables:
-        """Expose controller-visible telemetry."""
         return ProcessVariables(
             timestamp=self.sim_time,
             pressure_hyd=self.pressure_sensor_val,
@@ -239,12 +247,13 @@ class CentrifugalHydraulicMillingPlant(IPlant):
             spindle_torque_est=self.spindle_torque_est,
             rod_displacement=self.displacement_sensor_val,
             rod_velocity_est=self.mechanics.velocity,
-            wob_soft_sensor=0.0,                # Controller/SoftSensor populates this
+            wob_soft_sensor=0.0,
         )
 
     def get_truth_diagnostics(self) -> TruthDiagnostics:
-        """Expose complete internal physical truth for diagnostics and UI."""
-        _, a_contact = self.cutting.compute_engagement_geometry(self.mechanics.position)
+        _, contact_area = self.cutting.compute_engagement_geometry(
+            self.mechanics.position
+        )
         return TruthDiagnostics(
             timestamp=self.sim_time,
             rod_position_true=self.mechanics.position,
@@ -260,7 +269,7 @@ class CentrifugalHydraulicMillingPlant(IPlant):
             penetration_depth=self.cutting.penetration_depth,
             surface_recession_depth=self.cutting.surface_recession_depth,
             engagement_depth=self.cutting.engagement_depth,
-            contact_area=a_contact,
+            contact_area=contact_area,
             material_removal_rate=self.mrr_true,
             cumulative_volume_removed=self.cutting.cumulative_volume_removed,
             physical_rop=self.cutting.physical_rop_m_s,

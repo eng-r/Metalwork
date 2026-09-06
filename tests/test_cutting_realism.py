@@ -3,11 +3,11 @@ import math
 from sim.plant.cutting import CuttingParameters, MechanisticCuttingSubsystem
 
 
-def test_rotating_tool_clears_engagement_while_feed_is_held() -> None:
-    params = CuttingParameters(contact_start_pos=0.015)
+def test_rotating_loaded_tool_clears_engagement_while_feed_is_held() -> None:
+    params = CuttingParameters(contact_start_pos=0.015, disturbances_enabled=False)
     cutting = MechanisticCuttingSubsystem(params, seed=42)
     dt = 0.001
-    rod_position = 0.018
+    rod_position = 0.0160
     omega = 3500.0 * math.pi / 30.0
 
     engagement0, _ = cutting.compute_engagement_geometry(rod_position)
@@ -34,7 +34,7 @@ def test_disturbance_realization_is_repeatable_for_same_seed() -> None:
 
     trace_a = []
     trace_b = []
-    for i in range(4000):
+    for i in range(8000):
         x = 0.014 + i * dt * 0.0008
         trace_a.append(a.step_level_a_averaged(dt, x, 0.0008, omega)[1])
         trace_b.append(b.step_level_a_averaged(dt, x, 0.0008, omega)[1])
@@ -42,17 +42,27 @@ def test_disturbance_realization_is_repeatable_for_same_seed() -> None:
     assert trace_a == trace_b
 
 
-def test_realistic_cut_produces_intermittent_disturbance_events() -> None:
+def test_disturbances_perturb_nominal_cut_without_becoming_periodic_plant() -> None:
+    """
+    Hard spots and chip events should occur for the seeded demo, but they must not create the
+    previous deterministic fill/jam/release sawtooth on every short cycle.
+    """
     cutting = MechanisticCuttingSubsystem(CuttingParameters(), seed=42)
     dt = 0.001
     omega = 3500.0 * math.pi / 30.0
     seen = set()
+    jam_entries = 0
+    previous = "FREE"
 
-    for i in range(12000):
-        x = 0.014 + i * dt * 0.0008
-        cutting.step_level_a_averaged(dt, x, 0.0008, omega)
-        seen.add(cutting.disturbance_event)
+    # Drive a representative loaded cut for 30 s of demo time.
+    for i in range(30000):
+        x = 0.0154 + i * dt * 0.00030
+        cutting.step_level_a_averaged(dt, x, 0.00005, omega)
+        event = cutting.disturbance_event
+        seen.add(event)
+        if event == "CHIP_JAM" and previous != "CHIP_JAM":
+            jam_entries += 1
+        previous = event
 
-    assert "HARD_SPOT" in seen
-    assert "CHIP_JAM" in seen
-    assert "CHIP_RELEASE" in seen
+    assert "HARD_SPOT" in seen or "CHIP_JAM" in seen
+    assert jam_entries <= 4

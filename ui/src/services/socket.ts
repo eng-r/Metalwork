@@ -1,6 +1,4 @@
-/**
- * WebSocket client service connecting to FastAPI backend telemetry stream.
- */
+/** WebSocket client service connecting to FastAPI backend telemetry stream. */
 
 export interface TelemetryData {
   timestamp: number;
@@ -11,17 +9,25 @@ export interface TelemetryData {
   pressure_bar: number;
   pressure_true_bar: number;
   pressure_reference_bar: number;
+  pressure_feedforward_bar: number;
+  pressure_ceiling_bar: number;
+
   spindle_rpm: number;
   spindle_cmd_rpm: number;
   pump_rpm: number;
   pump_cmd_rpm: number;
+  pump_feedforward_rpm: number;
+
   spindle_torque_est: number;
   spindle_torque_true: number;
   target_torque_nm: number;
-  pressure_ceiling_bar: number;
-  torque_pressure_reference_bar: number;
+  achievable_torque_nm: number;
+  control_limited: boolean;
+  limit_reason: string;
+
   wob_soft_sensor: number;
   axial_cutting_force_true: number;
+  target_wob_n: number;
 
   rod_position_mm: number;
   penetration_depth_mm: number;
@@ -44,6 +50,9 @@ export interface AppliedConfig {
   target_torque_nm: number;
   pressure_ceiling_bar: number;
   spindle_rpm_nominal: number;
+  control_limited: boolean;
+  limit_reason: string;
+  achievable_torque_nm: number;
 }
 
 type TelemetryCallback = (data: TelemetryData) => void;
@@ -51,8 +60,8 @@ type TelemetryCallback = (data: TelemetryData) => void;
 class TelemetrySocketClient {
   private socket: WebSocket | null = null;
   private listeners: Set<TelemetryCallback> = new Set();
-  private reconnectInterval: number = 2000;
-  private url: string = 'ws://127.0.0.1:8000/ws/telemetry';
+  private reconnectInterval = 2000;
+  private url = 'ws://127.0.0.1:8000/ws/telemetry';
 
   constructor() {
     this.connect();
@@ -61,7 +70,6 @@ class TelemetrySocketClient {
   public connect(): void {
     try {
       this.socket = new WebSocket(this.url);
-
       this.socket.onmessage = (event: MessageEvent) => {
         try {
           const data: TelemetryData = JSON.parse(event.data);
@@ -70,11 +78,9 @@ class TelemetrySocketClient {
           console.error('[WS] Parse error:', err);
         }
       };
-
       this.socket.onclose = () => {
         setTimeout(() => this.connect(), this.reconnectInterval);
       };
-
       this.socket.onerror = () => {
         this.socket?.close();
       };
@@ -85,9 +91,7 @@ class TelemetrySocketClient {
 
   public subscribe(callback: TelemetryCallback): () => void {
     this.listeners.add(callback);
-    return () => {
-      this.listeners.delete(callback);
-    };
+    return () => this.listeners.delete(callback);
   }
 
   public async sendCommand(

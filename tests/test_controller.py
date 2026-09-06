@@ -1,81 +1,62 @@
-"""
-Unit tests comparing Baseline PID and Cascade LADRC controllers under load.
-"""
-
-import pytest
+"""Controller unit tests aligned with the physics-informed rebaseline."""
 
 from sim.common.contracts import ProcessVariables
-from sim.controller.adrc import CascadeLADRCController
+from sim.controller.adrc import CascadeLADRCController, FirstOrderPressureESO
 from sim.controller.baselines import BaselinePIDController
 from sim.controller.state_machine import OperatingMode
 
 
 def test_baseline_pid_clamping() -> None:
-    """Verify that baseline PID respects pump speed limits and anti-windup."""
     ctrl = BaselinePIDController(target_pressure_bar=40.0, max_pump_rpm=4500.0)
-    ctrl.reset()
-
-    sensors = ProcessVariables(
-        timestamp=0.0,
-        pressure_hyd=1.0e5,                     # 1 bar: large positive error
-        spindle_speed_res=366.5,                # 3500 RPM
-        spindle_torque_est=2.0,
-    )
-
-    cmd = ctrl.update(dt=0.010, sensors=sensors)
-    assert cmd.pump_speed_cmd_rpm <= 4500.0
-    assert cmd.pump_speed_cmd_rpm >= 0.0
-
-
-def test_cascade_ladrc_leso_convergence() -> None:
-    """Verify that discrete LESO tracks output pressure and estimates total disturbance."""
-    ctrl = CascadeLADRCController(target_pressure_bar=35.0)
-    ctrl.reset()
-
-    # Feed steady pressure measurements of 25 bar
-    sensors = ProcessVariables(
-        timestamp=0.0,
-        pressure_hyd=25.0e5,
-        spindle_speed_res=366.5,
-        spindle_torque_est=3.5,
-    )
-
-    for i in range(50):
-        sensors.timestamp = i * 0.010
-        cmd = ctrl.update(dt=0.010, sensors=sensors)
-
-    internal = ctrl.get_internal_states()
-    # Estimated pressure in LESO should be near measured 25 bar
-    assert abs(internal["leso_z1_pressure"] - 25.0) < 1.0
-
-
-def test_ladrc_asymmetric_overload_backoff() -> None:
-    """Verify that LADRC reference governor pulls back target pressure during high torque."""
-    ctrl = CascadeLADRCController(target_pressure_bar=45.0)
     ctrl.reset()
     ctrl.state_machine.current_mode = OperatingMode.NORMAL_MILLING
     ctrl.current_mode = OperatingMode.NORMAL_MILLING
-    ctrl.filtered_ref_bar = 45.0
 
-    # Normal cut
-    sensors_normal = ProcessVariables(
-        timestamp=0.1,
-        pressure_hyd=35.0e5,
+    sensors = ProcessVariables(
+        pressure_hyd=1.0e5,
         spindle_speed_res=366.5,
-        spindle_torque_est=3.0,
+        spindle_torque_est=2.0,
     )
-    ctrl.update(dt=0.010, sensors=sensors_normal)
-    ref_normal = ctrl.filtered_ref_bar
+    cmd = ctrl.update(0.010, sensors)
+    assert 0.0 <= cmd.pump_speed_cmd_rpm <= 4500.0
 
-    # Severe cutting torque overload (7.0 N*m)
-    sensors_overload = ProcessVariables(
-        timestamp=0.2,
-        pressure_hyd=35.0e5,
+
+def test_first_order_pressure_eso_converges_on_constant_signal() -> None:
+    eso = FirstOrderPressureESO(omega_o=14.0, b0=75.0)
+    eso.reset(initial_y=1.0)
+
+    # Zero local correction input, steady 25 bar measurement.
+    for _ in range(100):
+        eso.update(0.010, y_meas=25.0, v_applied=0.0)
+
+    assert abs(eso.z1 - 25.0) < 0.2
+
+
+def test_ladrc_normal_operation_does_not_relay_pump_off_at_small_pressure_crossing() -> None:
+    ctrl = CascadeLADRCController(target_pressure_bar=40.0, target_torque_nm=4.0)
+    ctrl.reset()
+    ctrl.state_machine.current_mode = OperatingMode.NORMAL_MILLING
+    ctrl.current_mode = OperatingMode.NORMAL_MILLING
+
+    sensors = ProcessVariables(
+        pressure_hyd=25.0e5,
         spindle_speed_res=366.5,
-        spindle_torque_est=7.0,
+        pump_speed_res=250.0,
+        spindle_torque_est=4.0,
     )
-    ctrl.update(dt=0.010, sensors=sensors_overload)
-    ref_overload = ctrl.filtered_ref_bar
+    cmd = ctrl.update(0.010, sensors)
 
-    # Asymmetric Reference Governor must reduce reference under overload
-    assert ref_overload < ref_normal
+    # Normal control is continuous around pump-map feedforward; zero pump is reserved for recovery.
+    assert cmd.enable_pump
+    assert cmd.pump_speed_cmd_rpm >= 0.0
+
+
+def test_setpoint_update_does_not_rewrite_safety_thresholds() -> None:
+    ctrl = CascadeLADRCController(target_torque_nm=4.0)
+    overload_before = ctrl.state_machine.overload_torque_thresh
+    ctrl.apply_runtime_config(
+        target_torque_nm=6.0,
+        pressure_ceiling_bar=40.0,
+        spindle_rpm_nominal=3500.0,
+    )
+    assert ctrl.state_machine.overload_torque_thresh == overload_before

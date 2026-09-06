@@ -1,9 +1,5 @@
 """
-Pusher mechanics with pressure-dependent seal friction and true stiction.
-
-The previous regularized tanh law produced exactly zero seal friction at zero
-velocity. That is not static friction and can create artificial rod/pressure
-limit cycles. This implementation explicitly balances sub-breakaway force.
+Axial pusher mechanics with pressure-dependent seal friction and explicit stiction.
 """
 
 from dataclasses import dataclass
@@ -28,8 +24,11 @@ class MechanicsParameters:
     viscous_seal_base: float = 350.0
     viscous_seal_alpha: float = 8.0e-5
 
-    # Velocity below which a static-force balance is allowed.
     velocity_transition_tol: float = 1.0e-4
+
+    # Soft-sensor prior: static seal force is not uniquely observable from pressure alone.
+    # The observer uses this fraction of the breakaway limit while the rod is stuck.
+    static_friction_observer_fraction: float = 0.65
 
 
 class MechanicsSubsystem:
@@ -49,10 +48,11 @@ class MechanicsSubsystem:
         self.position = initial_position
         self.velocity = initial_velocity
 
-    def _friction_levels(
+    def friction_levels(
         self,
         gauge_pressure: float,
     ) -> Tuple[float, float, float]:
+        """Return Coulomb, static-breakaway, and viscous seal coefficients."""
         p_eff = max(0.0, gauge_pressure)
         f_c = (
             self.params.coulomb_friction_base
@@ -68,6 +68,9 @@ class MechanicsSubsystem:
         )
         return f_c, f_s, sigma_v
 
+    # Backward-compatible alias for older code/tests.
+    _friction_levels = friction_levels
+
     def compute_seal_friction(
         self,
         gauge_pressure: float,
@@ -75,37 +78,57 @@ class MechanicsSubsystem:
         impending_force: float = 0.0,
     ) -> float:
         """
-        Signed friction force in the direction opposing motion/incipient motion.
+        Signed seal friction opposing actual or incipient rod motion.
+
+        In the static regime friction exactly balances the net sub-breakaway force. This is the
+        plant truth model; a soft sensor cannot know that exact value without another independent
+        load measurement.
         """
-        f_c, f_s, sigma_v = self._friction_levels(
-            gauge_pressure,
-        )
+        f_c, f_s, sigma_v = self.friction_levels(gauge_pressure)
         tol = self.params.velocity_transition_tol
 
         if abs(velocity) < tol:
             if abs(impending_force) <= f_s:
-                # Exact stiction balance.
                 return impending_force
-            direction = 1.0 if impending_force >= 0.0 else -1.0
-            return direction * f_s
+            return math.copysign(f_s, impending_force)
 
         abs_v = abs(velocity)
-        stribeck_factor = math.exp(
+        stribeck = math.exp(
             -(
                 abs_v
-                / max(
-                    1.0e-6,
-                    self.params.stribeck_velocity,
-                )
-            )
-            ** self.params.stribeck_exponent
+                / max(1.0e-6, self.params.stribeck_velocity)
+            ) ** self.params.stribeck_exponent
         )
-        dry_magnitude = (
-            f_c
-            + (f_s - f_c) * stribeck_factor
+        dry = f_c + (f_s - f_c) * stribeck
+        magnitude = dry + sigma_v * abs_v
+        return math.copysign(magnitude, velocity)
+
+    def estimate_forward_seal_friction(
+        self,
+        gauge_pressure: float,
+        velocity: float,
+    ) -> float:
+        """
+        Observer-side prior for forward pusher friction.
+
+        Static friction is set-valued. When the rod is nearly stationary we therefore return a
+        calibrated fraction of the breakaway bound rather than the impossible-to-know exact plant
+        stiction force. This makes the WOB estimate explicit about the information limitation.
+        """
+        f_c, f_s, sigma_v = self.friction_levels(gauge_pressure)
+        tol = self.params.velocity_transition_tol
+        if abs(velocity) < tol:
+            return self.params.static_friction_observer_fraction * f_s
+
+        abs_v = abs(velocity)
+        stribeck = math.exp(
+            -(
+                abs_v
+                / max(1.0e-6, self.params.stribeck_velocity)
+            ) ** self.params.stribeck_exponent
         )
-        total_magnitude = dry_magnitude + sigma_v * abs_v
-        return math.copysign(total_magnitude, velocity)
+        dry = f_c + (f_s - f_c) * stribeck
+        return math.copysign(dry + sigma_v * abs_v, velocity)
 
     def compute_endstop_force(
         self,
@@ -118,14 +141,12 @@ class MechanicsSubsystem:
                 self.params.endstop_stiffness * penetration
                 - self.params.endstop_damping * velocity
             )
-
         if position > self.params.stroke_max:
             penetration = position - self.params.stroke_max
             return -(
                 self.params.endstop_stiffness * penetration
                 + self.params.endstop_damping * velocity
             )
-
         return 0.0
 
     def compute_acceleration(
@@ -136,37 +157,28 @@ class MechanicsSubsystem:
         position: float,
         velocity: float,
     ) -> Tuple[float, float]:
-        f_hyd = gauge_pressure * piston_area
+        f_hyd = max(0.0, gauge_pressure) * piston_area
         f_structural = self.params.viscous_damping * velocity
-        f_stop = self.compute_endstop_force(
-            position,
-            velocity,
-        )
+        f_stop = self.compute_endstop_force(position, velocity)
 
-        # Force that the seal friction must oppose.
         impending = (
             f_hyd
             - f_structural
             - axial_cutting_force
             + f_stop
         )
-
         f_friction = self.compute_seal_friction(
             gauge_pressure,
             velocity,
             impending_force=impending,
         )
 
-        _, f_static_limit, _ = self._friction_levels(
-            gauge_pressure,
-        )
+        _, f_static_limit, _ = self.friction_levels(gauge_pressure)
         if (
             abs(velocity) < self.params.velocity_transition_tol
             and abs(impending) <= f_static_limit
         ):
-            # Stuck seal: friction exactly balances the remaining load.
             return 0.0, f_friction
 
-        f_net = impending - f_friction
-        acceleration = f_net / self.params.effective_mass
+        acceleration = (impending - f_friction) / self.params.effective_mass
         return acceleration, f_friction
