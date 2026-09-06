@@ -44,6 +44,13 @@ class PMSMSpindleDrive:
         self.resolver_speed = 0.0               # Estimated speed from resolver (rad/s)
         self.speed_integrator = 0.0             # Speed loop integrator state
 
+        # Dynamic load-torque observer states. Without subtracting J*dω/dt the
+        # previous Iq observer interpreted motor acceleration torque as ToB,
+        # causing false contact/overload detection during spindle speed changes.
+        self.prev_resolver_speed = 0.0
+        self.accel_est_filtered = 0.0
+        self.load_torque_est_filtered = 0.0
+
     def reset(self, initial_speed_rads: float = 0.0) -> None:
         """Reset drive states."""
         self.rng = random.Random(self.seed)
@@ -53,6 +60,9 @@ class PMSMSpindleDrive:
         self.filtered_iq = 0.0
         self.resolver_speed = initial_speed_rads
         self.speed_integrator = 0.0
+        self.prev_resolver_speed = initial_speed_rads
+        self.accel_est_filtered = 0.0
+        self.load_torque_est_filtered = 0.0
 
     def compute_electromagnetic_torque(self, iq: float) -> float:
         """Standard SPMSM torque: T_e = 1.5 * p * lambda_m * i_q."""
@@ -98,14 +108,42 @@ class PMSMSpindleDrive:
         alpha_res = dt / (0.002 + dt)
         self.resolver_speed += alpha_res * (self.mechanical_speed - self.resolver_speed)
 
-        # 6. Filtered Iq and torque observer
+        # 6. Filtered Iq and dynamic load-torque observer.
         alpha_iq = dt / (self.params.iq_filter_tau + dt)
         self.filtered_iq += alpha_iq * (self.iq_current - self.filtered_iq)
 
-        # Soft torque sensor derived from filtered Iq
-        torque_est = self.compute_electromagnetic_torque(self.filtered_iq) - self.params.friction_damping * self.resolver_speed
+        raw_accel = (
+            self.resolver_speed - self.prev_resolver_speed
+        ) / max(dt, 1.0e-9)
+        self.prev_resolver_speed = self.resolver_speed
 
-        return self.mechanical_speed, self.resolver_speed, max(0.0, torque_est)
+        alpha_accel = dt / (0.025 + dt)
+        self.accel_est_filtered += alpha_accel * (
+            raw_accel - self.accel_est_filtered
+        )
+
+        # Rotor balance:
+        #   J*dω/dt = T_em - T_load - B*ω
+        # therefore:
+        #   T_load = T_em - B*ω - J*dω/dt
+        t_em_est = self.compute_electromagnetic_torque(self.filtered_iq)
+        torque_load_raw = (
+            t_em_est
+            - self.params.friction_damping * self.resolver_speed
+            - self.params.rotor_inertia * self.accel_est_filtered
+        )
+        torque_load_raw = max(0.0, torque_load_raw)
+
+        alpha_load = dt / (0.018 + dt)
+        self.load_torque_est_filtered += alpha_load * (
+            torque_load_raw - self.load_torque_est_filtered
+        )
+
+        return (
+            self.mechanical_speed,
+            self.resolver_speed,
+            max(0.0, self.load_torque_est_filtered),
+        )
 
 
 class PMSMPumpDrive:
@@ -113,9 +151,15 @@ class PMSMPumpDrive:
     Simulates the centrifugal pump PMSM motor drive.
     """
 
-    def __init__(self, inertia: float = 0.002, tau_speed: float = 0.02) -> None:
+    def __init__(
+        self,
+        inertia: float = 0.002,
+        tau_speed: float = 0.075,
+        max_accel_rpm_s: float = 12000.0,
+    ) -> None:
         self.inertia = inertia
         self.tau_speed = tau_speed
+        self.max_accel_rads_s2 = max_accel_rpm_s * math.pi / 30.0
         self.mechanical_speed = 0.0
         self.resolver_speed = 0.0
 
@@ -124,19 +168,25 @@ class PMSMPumpDrive:
         self.resolver_speed = initial_speed_rads
 
     def step(self, dt: float, speed_command_rads: float) -> float:
-        """First-order speed drive response with rate limits."""
-        max_rads = 6000.0 * math.pi / 30.0      # 6000 RPM max
+        """Smooth speed-servo response with physical acceleration saturation."""
+        max_rads = 6000.0 * math.pi / 30.0
         cmd_clamped = max(0.0, min(max_rads, speed_command_rads))
 
-        # Slew rate limit (5000 RPM / s = ~523 rad/s^2)
-        max_delta = 523.0 * dt
-        delta = cmd_clamped - self.mechanical_speed
-        delta = max(-max_delta, min(max_delta, delta))
+        # Previous implementation first clipped a position-like delta and then
+        # multiplied it by a first-order alpha. That double attenuation produces
+        # visually perfect triangular ramps. Here the first-order law produces an
+        # acceleration request, which is smoothly saturated once.
+        accel_request = (
+            cmd_clamped - self.mechanical_speed
+        ) / max(1.0e-4, self.tau_speed)
+        accel = self.max_accel_rads_s2 * math.tanh(
+            accel_request / max(1.0e-6, self.max_accel_rads_s2)
+        )
+        self.mechanical_speed += accel * dt
+        self.mechanical_speed = max(0.0, min(max_rads, self.mechanical_speed))
 
-        alpha = dt / (self.tau_speed + dt)
-        self.mechanical_speed += alpha * delta
-
-        # Resolver tracking
         alpha_res = dt / (0.002 + dt)
-        self.resolver_speed += alpha_res * (self.mechanical_speed - self.resolver_speed)
+        self.resolver_speed += alpha_res * (
+            self.mechanical_speed - self.resolver_speed
+        )
         return self.resolver_speed

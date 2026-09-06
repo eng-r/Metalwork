@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Sliders, RefreshCw, Check } from 'lucide-react';
 import { telemetryClient } from '../services/socket';
 import {
@@ -9,11 +9,17 @@ import {
 
 interface ControlPanelProps {
   currentController: string;
+  currentTargetTorqueNm: number;
+  currentPressureCeilingBar: number;
+  currentSpindleRpm: number;
   onConfigApplied?: () => void;
 }
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
   currentController,
+  currentTargetTorqueNm,
+  currentPressureCeilingBar,
+  currentSpindleRpm,
   onConfigApplied,
 }) => {
   const [controllerType, setControllerType] = useState<string>(
@@ -21,17 +27,26 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   );
 
   // Operator-facing units only. Convert back to backend engineering units on apply.
-  const [targetToBFtLbf, setTargetToBFtLbf] = useState<number>(3.0);
-  const [pressureCeilingPsi, setPressureCeilingPsi] = useState<number>(
-    barToPsi(35.0),
+  const [targetToBFtLbf, setTargetToBFtLbf] = useState<number>(
+    currentTargetTorqueNm * 0.7375621493,
   );
-  const [spindleRpm, setSpindleRpm] = useState<number>(3500.0);
+  const [pressureCeilingPsi, setPressureCeilingPsi] = useState<number>(
+    barToPsi(currentPressureCeilingBar),
+  );
+  const [spindleRpm, setSpindleRpm] = useState<number>(currentSpindleRpm);
   const [hardnessHrc, setHardnessHrc] = useState<number>(42.0);
   const [bypassScale, setBypassScale] = useState<number>(1.0);
   const [saved, setSaved] = useState<boolean>(false);
+  const [appliedToB, setAppliedToB] = useState<number>(
+    currentTargetTorqueNm * 0.7375621493,
+  );
+
+  useEffect(() => {
+    setAppliedToB(currentTargetTorqueNm * 0.7375621493);
+  }, [currentTargetTorqueNm]);
 
   const handleApply = async () => {
-    await telemetryClient.updateConfig({
+    const applied = await telemetryClient.updateConfig({
       controller_type: controllerType,
       target_pressure_bar: psiToBar(pressureCeilingPsi),
       target_torque_nm: ftLbfToNm(targetToBFtLbf),
@@ -39,9 +54,15 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
       material_hardness_hrc: hardnessHrc,
       bypass_orifice_area_scale: bypassScale,
     });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-    onConfigApplied?.();
+    if (applied) {
+      setAppliedToB(applied.target_torque_nm * 0.7375621493);
+      setTargetToBFtLbf(applied.target_torque_nm * 0.7375621493);
+      setPressureCeilingPsi(barToPsi(applied.pressure_ceiling_bar));
+      setSpindleRpm(applied.spindle_rpm_nominal);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      onConfigApplied?.();
+    }
   };
 
   return (
@@ -127,8 +148,11 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
               onChange={(e) => setTargetToBFtLbf(parseFloat(e.target.value))}
               className="w-full accent-primary h-1.5 bg-slate-200 rounded"
             />
-            <div className="text-[10px] text-slate-400 font-mono mt-1">
-              Primary milling-load setpoint used by both PID and LADRC comparisons.
+            <div className="text-[10px] text-slate-400 font-mono mt-1 flex justify-between">
+              <span>Primary milling-load setpoint used by both PID and LADRC.</span>
+              <span className="font-bold text-emerald-700">
+                ACTIVE SP: {appliedToB.toFixed(1)} ft·lbf
+              </span>
             </div>
           </div>
 

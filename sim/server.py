@@ -104,10 +104,10 @@ class SimulationRuntime:
             if sleep_time > 0.001:
                 time.sleep(sleep_time)
 
-    def reconfigure(self, cfg: ConfigRequest) -> None:
-        was_running = self.is_running
-        self.pause()
-
+    def reconfigure(self, cfg: ConfigRequest) -> Dict[str, Any]:
+        # Configuration is live. A ToB setpoint change must not restart the
+        # controller in APPROACH or reset its observer/integrator while the tool
+        # is already cutting.
         with self.lock:
             self.plant.cut_params.averaged_specific_energy = (
                 cfg.material_hardness_hrc / 42.0
@@ -116,21 +116,56 @@ class SimulationRuntime:
                 1.2e-8 * cfg.bypass_orifice_area_scale
             )
 
-            controller_cls = (
-                BaselinePIDController
-                if cfg.controller_type.lower() == "pid"
-                else CascadeLADRCController
+            wants_pid = cfg.controller_type.lower() == "pid"
+            same_architecture = (
+                (wants_pid and isinstance(self.controller, BaselinePIDController))
+                or (
+                    (not wants_pid)
+                    and isinstance(self.controller, CascadeLADRCController)
+                )
             )
-            self.controller = controller_cls(
-                target_pressure_bar=cfg.target_pressure_bar,
-                target_torque_nm=cfg.target_torque_nm,
-                spindle_rpm_nominal=cfg.spindle_rpm_nominal,
-            )
-            self.controller.reset()
-            self.scheduler.controller = self.controller
 
-        if was_running:
-            self.start()
+            if same_architecture:
+                self.controller.apply_runtime_config(
+                    target_torque_nm=cfg.target_torque_nm,
+                    pressure_ceiling_bar=cfg.target_pressure_bar,
+                    spindle_rpm_nominal=cfg.spindle_rpm_nominal,
+                )
+            else:
+                # Architecture changes are intentionally explicit and may have
+                # a transient. Ordinary ToB/SP changes never take this path.
+                controller_cls = (
+                    BaselinePIDController
+                    if wants_pid
+                    else CascadeLADRCController
+                )
+                self.controller = controller_cls(
+                    target_pressure_bar=cfg.target_pressure_bar,
+                    target_torque_nm=cfg.target_torque_nm,
+                    spindle_rpm_nominal=cfg.spindle_rpm_nominal,
+                )
+                self.controller.reset()
+                self.scheduler.controller = self.controller
+
+            internal = self.controller.get_internal_states()
+            return {
+                "controller_type": internal.get(
+                    "controller_type",
+                    self.controller.__class__.__name__,
+                ),
+                "target_torque_nm": float(
+                    internal.get("target_torque_nm", cfg.target_torque_nm)
+                ),
+                "pressure_ceiling_bar": float(
+                    internal.get(
+                        "pressure_ceiling_bar",
+                        cfg.target_pressure_bar,
+                    )
+                ),
+                "spindle_rpm_nominal": float(
+                    self.controller.spindle_rpm_nominal
+                ),
+            }
 
 
 runtime = SimulationRuntime()
@@ -172,9 +207,9 @@ def post_command(cmd: CommandRequest) -> Dict[str, str]:
 
 
 @app.post("/api/configure")
-def post_configure(cfg: ConfigRequest) -> Dict[str, str]:
-    runtime.reconfigure(cfg)
-    return {"status": "ok"}
+def post_configure(cfg: ConfigRequest) -> Dict[str, Any]:
+    applied = runtime.reconfigure(cfg)
+    return {"status": "ok", **applied}
 
 
 @app.get("/api/export/csv", response_class=PlainTextResponse)
@@ -217,6 +252,9 @@ async def websocket_telemetry(websocket: WebSocket) -> None:
                     snap.truth.chamber_pressure_true / 1.0e5, 3
                 ),
                 "spindle_rpm": round(snap.sensors.spindle_rpm, 1),
+                "spindle_cmd_rpm": round(
+                    snap.commands.spindle_speed_cmd_rpm, 1
+                ),
                 "pump_rpm": round(snap.sensors.pump_rpm, 1),
                 "pump_cmd_rpm": round(snap.commands.pump_speed_cmd_rpm, 1),
                 "spindle_torque_est": round(
@@ -227,6 +265,18 @@ async def websocket_telemetry(websocket: WebSocket) -> None:
                 ),
                 "target_torque_nm": round(
                     float(internal.get("target_torque_nm", 4.0)), 4
+                ),
+                "pressure_ceiling_bar": round(
+                    float(internal.get("pressure_ceiling_bar", 35.0)), 3
+                ),
+                "torque_pressure_reference_bar": round(
+                    float(
+                        internal.get(
+                            "torque_pressure_reference_bar",
+                            snap.sensors.pressure_bar,
+                        )
+                    ),
+                    3,
                 ),
                 "wob_soft_sensor": round(snap.sensors.wob_soft_sensor, 2),
                 "axial_cutting_force_true": round(

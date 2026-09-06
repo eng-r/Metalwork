@@ -60,6 +60,30 @@ class BaselinePIDController(IController):
         self.last_pump_cmd_rpm = 0.0
         self.current_mode = OperatingMode.APPROACH
 
+    def apply_runtime_config(
+        self,
+        target_torque_nm: float,
+        pressure_ceiling_bar: float,
+        spindle_rpm_nominal: float,
+    ) -> None:
+        """Bumpless live update: preserve PID/FSM state for setpoint changes."""
+        self.target_torque_nm = max(0.1, float(target_torque_nm))
+        self.target_pressure_bar = max(10.5, float(pressure_ceiling_bar))
+        self.spindle_rpm_nominal = max(100.0, float(spindle_rpm_nominal))
+
+        self.load_governor.set_target_torque(self.target_torque_nm)
+        self.load_governor.set_pressure_ceiling(self.target_pressure_bar)
+
+        self.state_machine.nominal_spindle_rpm = self.spindle_rpm_nominal
+        self.state_machine.overload_torque_thresh = max(
+            self.target_torque_nm * 1.55,
+            self.target_torque_nm + 1.8,
+        )
+        self.state_machine.safe_torque_thresh = max(
+            self.target_torque_nm * 1.12,
+            self.target_torque_nm + 0.5,
+        )
+
     def reset(self) -> None:
         self.state_machine.reset(nominal_spindle_rpm=self.spindle_rpm_nominal)
         self.soft_wob.reset()
@@ -127,17 +151,10 @@ class BaselinePIDController(IController):
             pump_target = 0.0
             spindle_target = self.spindle_rpm_nominal
 
-        delta_max_up = self.pos_slew * dt
-        delta_max_down = self.neg_slew * dt
-        delta = pump_target - self.last_pump_cmd_rpm
-        if delta > delta_max_up:
-            pump_cmd = self.last_pump_cmd_rpm + delta_max_up
-        elif delta < -delta_max_down:
-            pump_cmd = self.last_pump_cmd_rpm - delta_max_down
-        else:
-            pump_cmd = pump_target
-
-        pump_cmd = max(0.0, min(self.max_pump_rpm, pump_cmd))
+        # Physical pump-drive dynamics are modeled in PMSMPumpDrive. Avoid a
+        # second speed slew limiter in the controller, which otherwise creates
+        # artificial saw/triangle waveforms and obscures PID-vs-LADRC behavior.
+        pump_cmd = max(0.0, min(self.max_pump_rpm, pump_target))
         self.last_pump_cmd_rpm = pump_cmd
 
         return ControlCommands(

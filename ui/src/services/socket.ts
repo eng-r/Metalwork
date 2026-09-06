@@ -11,11 +11,14 @@ export interface TelemetryData {
   pressure_bar: number;
   pressure_true_bar: number;
   spindle_rpm: number;
+  spindle_cmd_rpm: number;
   pump_rpm: number;
   pump_cmd_rpm: number;
   spindle_torque_est: number;
   spindle_torque_true: number;
   target_torque_nm: number;
+  pressure_ceiling_bar: number;
+  torque_pressure_reference_bar: number;
   wob_soft_sensor: number;
   axial_cutting_force_true: number;
 
@@ -31,6 +34,14 @@ export interface TelemetryData {
   demo_acceleration: number;
   equivalent_process_time_s: number;
   disturbance_event: string;
+}
+
+export interface AppliedConfig {
+  status: string;
+  controller_type: string;
+  target_torque_nm: number;
+  pressure_ceiling_bar: number;
+  spindle_rpm_nominal: number;
 }
 
 type TelemetryCallback = (data: TelemetryData) => void;
@@ -98,15 +109,20 @@ class TelemetrySocketClient {
     spindle_rpm_nominal: number;
     material_hardness_hrc: number;
     bypass_orifice_area_scale: number;
-  }): Promise<void> {
+  }): Promise<AppliedConfig | null> {
     try {
-      await fetch('http://127.0.0.1:8000/api/configure', {
+      const response = await fetch('http://127.0.0.1:8000/api/configure', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config),
       });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return (await response.json()) as AppliedConfig;
     } catch (err) {
       console.error('[API] Failed to update config:', err);
+      return null;
     }
   }
 }

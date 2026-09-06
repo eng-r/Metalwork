@@ -104,6 +104,30 @@ class CascadeLADRCController(IController):
         self.last_pump_cmd_rpm = 0.0
         self.current_mode = OperatingMode.APPROACH
 
+    def apply_runtime_config(
+        self,
+        target_torque_nm: float,
+        pressure_ceiling_bar: float,
+        spindle_rpm_nominal: float,
+    ) -> None:
+        """Bumpless live update: do not reset LESO, FSM, or pump command."""
+        self.target_torque_nm = max(0.1, float(target_torque_nm))
+        self.target_pressure_bar = max(10.5, float(pressure_ceiling_bar))
+        self.spindle_rpm_nominal = max(100.0, float(spindle_rpm_nominal))
+
+        self.load_governor.set_target_torque(self.target_torque_nm)
+        self.load_governor.set_pressure_ceiling(self.target_pressure_bar)
+
+        self.state_machine.nominal_spindle_rpm = self.spindle_rpm_nominal
+        self.state_machine.overload_torque_thresh = max(
+            self.target_torque_nm * 1.55,
+            self.target_torque_nm + 1.8,
+        )
+        self.state_machine.safe_torque_thresh = max(
+            self.target_torque_nm * 1.12,
+            self.target_torque_nm + 0.5,
+        )
+
     def reset(self) -> None:
         self.state_machine.reset(nominal_spindle_rpm=self.spindle_rpm_nominal)
         self.soft_wob.reset()
@@ -179,14 +203,10 @@ class CascadeLADRCController(IController):
 
         pump_rpm_cmd = max(0.0, min(self.max_pump_rpm, pump_rpm_cmd))
 
-        delta_cmd = pump_rpm_cmd - self.last_pump_cmd_rpm
-        max_up = 1500.0 * dt
-        max_down = 5000.0 * dt
-        if delta_cmd > max_up:
-            pump_rpm_cmd = self.last_pump_cmd_rpm + max_up
-        elif delta_cmd < -max_down:
-            pump_rpm_cmd = self.last_pump_cmd_rpm - max_down
-
+        # Do not add a second artificial pump-speed slew limiter here.
+        # The physical PMSMPumpDrive already owns actuator acceleration dynamics.
+        # Serial slew limiters were a major source of the geometric triangular
+        # pump-RPM waveform.
         self.last_pump_cmd_rpm = pump_rpm_cmd
 
         return ControlCommands(

@@ -8,13 +8,16 @@ import {
 
 interface ChartPoint {
   t: number;
-  pressure: number;       // backend bar
-  torque: number;         // backend N*m
-  targetTorque: number;   // backend N*m
-  wob: number;            // backend N
+  pressure: number;
+  torque: number;
+  torqueTrue: number;
+  targetTorque: number;
+  wob: number;
   spindleRpm: number;
+  spindleCmdRpm: number;
   pumpRpm: number;
-  ropMps: number;         // backend m/s
+  pumpCmdRpm: number;
+  ropMps: number;
 }
 
 interface TelemetryChartsProps {
@@ -93,11 +96,11 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
       value: (p: ChartPoint) => number,
       stroke: string,
       lineWidth = 2,
-      dashed = false,
+      dash: number[] = [],
     ) => {
       ctx.strokeStyle = stroke;
       ctx.lineWidth = lineWidth;
-      if (dashed) ctx.setLineDash([5, 4]);
+      ctx.setLineDash(dash);
       ctx.beginPath();
       history.forEach((pt, idx) => {
         const x = getX(pt.t);
@@ -111,6 +114,38 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
       });
       ctx.stroke();
       ctx.setLineDash([]);
+    };
+
+    const drawLegend = (
+      top: number,
+      entries: Array<{
+        label: string;
+        color: string;
+        dash?: number[];
+      }>,
+    ) => {
+      ctx.font = '10px "JetBrains Mono", monospace';
+      let x = padLeft + plotWidth - 8;
+      ctx.textAlign = 'right';
+
+      [...entries].reverse().forEach((entry) => {
+        const labelWidth = ctx.measureText(entry.label).width;
+        ctx.fillStyle = '#475569';
+        ctx.fillText(entry.label, x, top + 16);
+        x -= labelWidth + 6;
+
+        ctx.strokeStyle = entry.color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash(entry.dash ?? []);
+        ctx.beginPath();
+        ctx.moveTo(x - 22, top + 12);
+        ctx.lineTo(x - 4, top + 12);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        x -= 30;
+      });
+
+      ctx.textAlign = 'left';
     };
 
     const top1 = 8;
@@ -128,7 +163,16 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
       '#2563eb',
     );
 
-    const torqueMaxFtLbf = nmToFtLbf(10);
+    // Dynamic ToB scale so the desired setpoint and its changes never disappear
+    // against a fixed 0..10 N*m axis.
+    const maxTorqueFtLbf = Math.max(
+      4.0,
+      ...history.map((p) => nmToFtLbf(p.torque)),
+      ...history.map((p) => nmToFtLbf(p.torqueTrue)),
+      ...history.map((p) => nmToFtLbf(p.targetTorque)),
+    );
+    const torqueMaxFtLbf = Math.ceil(maxTorqueFtLbf * 1.25 * 2) / 2;
+
     drawLaneGrid(
       top2,
       'TORQUE ON BIT (ToB)',
@@ -142,9 +186,18 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
       0,
       torqueMaxFtLbf,
       (p) => nmToFtLbf(p.targetTorque),
-      '#94a3b8',
-      1.3,
-      true,
+      '#64748b',
+      1.6,
+      [7, 4],
+    );
+    drawSeries(
+      top2,
+      0,
+      torqueMaxFtLbf,
+      (p) => nmToFtLbf(p.torqueTrue),
+      '#f59e0b',
+      1.2,
+      [2, 3],
     );
     drawSeries(
       top2,
@@ -152,18 +205,59 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
       torqueMaxFtLbf,
       (p) => nmToFtLbf(p.torque),
       '#dc2626',
+      2.2,
     );
+    drawLegend(top2, [
+      { label: 'SP', color: '#64748b', dash: [7, 4] },
+      { label: 'Iq estimate', color: '#dc2626' },
+      { label: 'truth', color: '#f59e0b', dash: [2, 3] },
+    ]);
 
-    drawLaneGrid(top3, 'DRIVE SPEEDS (SPINDLE & PUMP)', 0, 5000, 'RPM');
-    drawSeries(top3, 0, 5000, (p) => p.spindleRpm, '#334155', 1.8);
-    drawSeries(top3, 0, 5000, (p) => p.pumpRpm, '#d97706', 1.8);
+    drawLaneGrid(top3, 'DRIVE SPEEDS', 0, 5000, 'RPM');
+    drawSeries(
+      top3,
+      0,
+      5000,
+      (p) => p.spindleRpm,
+      '#334155',
+      2.0,
+    );
+    drawSeries(
+      top3,
+      0,
+      5000,
+      (p) => p.pumpRpm,
+      '#d97706',
+      2.0,
+    );
+    drawSeries(
+      top3,
+      0,
+      5000,
+      (p) => p.pumpCmdRpm,
+      '#fbbf24',
+      1.25,
+      [6, 4],
+    );
+    drawLegend(top3, [
+      { label: 'SPINDLE actual', color: '#334155' },
+      { label: 'PUMP actual', color: '#d97706' },
+      { label: 'PUMP command', color: '#fbbf24', dash: [6, 4] },
+    ]);
 
     const maxRopSeen = Math.max(
       ...history.map((p) => mpsToMmPerMin(p.ropMps)),
       0.08,
     );
     const ropMax = Math.max(0.12, Math.ceil(maxRopSeen / 0.05) * 0.05);
-    drawLaneGrid(top4, 'PHYSICAL RATE OF PENETRATION', 0, ropMax, 'mm/min', 2);
+    drawLaneGrid(
+      top4,
+      'PHYSICAL RATE OF PENETRATION',
+      0,
+      ropMax,
+      'mm/min',
+      2,
+    );
     drawSeries(
       top4,
       0,
@@ -191,7 +285,7 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
             MULTICHANNEL TELEMETRY RECORDER
           </div>
           <div className="text-[11px] text-slate-400 font-mono">
-            4× waveform history • ROP is physical, material geometry is demo-time compressed
+            ToB shows command + Iq observer + plant truth • drive lane shows actual vs command
           </div>
         </div>
         <button
@@ -209,8 +303,8 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({ history }) => 
 
       <div className="flex flex-wrap items-center justify-center gap-5 mt-3 text-[11px] font-mono text-slate-500 border-t border-border pt-2">
         <span>Pressure [psi]</span>
-        <span>ToB [ft·lbf] — dashed = SP</span>
-        <span>Spindle / Pump [RPM]</span>
+        <span>ToB: SP / Iq estimate / truth [ft·lbf]</span>
+        <span>RPM: spindle actual / pump actual / pump command</span>
         <span>ROP [mm/min]</span>
       </div>
     </div>

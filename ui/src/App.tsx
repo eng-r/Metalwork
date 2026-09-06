@@ -25,10 +25,13 @@ interface ChartPoint {
   t: number;
   pressure: number;
   torque: number;
+  torqueTrue: number;
   targetTorque: number;
   wob: number;
   spindleRpm: number;
+  spindleCmdRpm: number;
   pumpRpm: number;
+  pumpCmdRpm: number;
   ropMps: number;
 }
 
@@ -42,11 +45,14 @@ export const App: React.FC = () => {
     pressure_bar: 1.01,
     pressure_true_bar: 1.01,
     spindle_rpm: 0.0,
+    spindle_cmd_rpm: 3500.0,
     pump_rpm: 0.0,
     pump_cmd_rpm: 0.0,
     spindle_torque_est: 0.0,
     spindle_torque_true: 0.0,
     target_torque_nm: 4.0,
+    pressure_ceiling_bar: 35.0,
+    torque_pressure_reference_bar: 18.0,
     wob_soft_sensor: 0.0,
     axial_cutting_force_true: 0.0,
     rod_position_mm: 0.0,
@@ -72,10 +78,13 @@ export const App: React.FC = () => {
           t: data.timestamp,
           pressure: data.pressure_bar,
           torque: data.spindle_torque_est,
+          torqueTrue: data.spindle_torque_true,
           targetTorque: data.target_torque_nm,
           wob: data.wob_soft_sensor,
           spindleRpm: data.spindle_rpm,
+          spindleCmdRpm: data.spindle_cmd_rpm,
           pumpRpm: data.pump_rpm,
+          pumpCmdRpm: data.pump_cmd_rpm,
           ropMps: data.physical_rop_m_s,
         };
         const updated = [...prev, nextPt];
@@ -288,7 +297,12 @@ export const App: React.FC = () => {
 
           {activeTab === 'tuning' && (
             <div className="flex justify-center">
-              <ControlPanel currentController={telemetry.controller_type} />
+              <ControlPanel
+                currentController={telemetry.controller_type}
+                currentTargetTorqueNm={telemetry.target_torque_nm}
+                currentPressureCeilingBar={telemetry.pressure_ceiling_bar}
+                currentSpindleRpm={telemetry.spindle_cmd_rpm}
+              />
             </div>
           )}
 
